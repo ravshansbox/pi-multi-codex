@@ -102,6 +102,15 @@ const PROVIDER_CONFIG = {
 	baseUrl: "https://chatgpt.com/backend-api",
 	models: [
 		{
+			id: "gpt-5.4-mini",
+			name: "GPT-5.4 Mini",
+			reasoning: false,
+			input: ["text", "image"] as const,
+			cost: { input: 0.75, output: 4.5 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		},
+		{
 			id: "gpt-5.4",
 			name: "GPT-5.4",
 			reasoning: true,
