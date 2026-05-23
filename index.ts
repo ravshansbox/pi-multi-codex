@@ -443,7 +443,8 @@ async function selectAccount(
 
 		const latest = accounts[i];
 		const weekResetAt = latest.usage?.windows["week"]?.resetAt ?? Infinity;
-		const depleted = latest.depleted && latest.depleted.until > now;
+		const weekPercent = latest.usage?.windows["week"]?.usedPercent ?? 0;
+		const depleted = (latest.depleted && latest.depleted.until > now) || weekPercent >= 100;
 		(depleted ? fallback : preferred).push({ account: latest, index: i, weekResetAt });
 	}
 
