@@ -133,8 +133,6 @@ const PROVIDER_CONFIG = {
 	],
 } as const;
 
-const STORE_KEY = PROVIDER_CONFIG.provider;
-
 // =============================================================================
 // Types
 // =============================================================================
@@ -185,7 +183,7 @@ function loadStore(): AccountStore {
 	try {
 		if (fs.existsSync(STORE_PATH)) {
 			const raw = JSON.parse(fs.readFileSync(STORE_PATH, "utf-8")) as any;
-			const store: AccountStore = raw.accounts ? raw : { accounts: raw[STORE_KEY]?.accounts ?? [] };
+			const store: AccountStore = raw.accounts ? raw : { accounts: [] };
 			// Clean up expired depleted entries
 			const now = Date.now();
 			for (const acc of store.accounts) {
@@ -270,12 +268,6 @@ function hashIndex(sessionKey: string, accountCount: number): number {
 	return digest.readUInt32BE(0) % accountCount;
 }
 
-function getAccountOrder(sessionKey: string, accountCount: number): number[] {
-	if (accountCount <= 0) return [];
-	const start = hashIndex(sessionKey, accountCount);
-	return Array.from({ length: accountCount }, (_, i) => (start + i) % accountCount);
-}
-
 // =============================================================================
 // Token Management
 // =============================================================================
@@ -354,19 +346,25 @@ async function fetchUsage(account: StoredAccount): Promise<{ windows: Record<str
 		const data = (await res.json()) as any;
 		const windows: Record<string, { usedPercent: number; resetAt?: number }> = {};
 
-		if (data.rate_limit?.primary_window) {
-			const pw = data.rate_limit.primary_window;
-			windows["primary"] = {
-				usedPercent: pw.used_percent || 0,
-				resetAt: pw.reset_at ? new Date(pw.reset_at * 1000).getTime() : undefined,
+		const rawWindows = [
+			data.rate_limit?.primary_window,
+			data.rate_limit?.secondary_window,
+		].filter(Boolean);
+
+		const weeklyWindow = rawWindows[rawWindows.length - 1];
+		const primaryWindow = rawWindows.length > 1 ? rawWindows[0] : undefined;
+
+		if (weeklyWindow) {
+			windows["week"] = {
+				usedPercent: weeklyWindow.used_percent || 0,
+				resetAt: weeklyWindow.reset_at ? new Date(weeklyWindow.reset_at * 1000).getTime() : undefined,
 			};
 		}
 
-		if (data.rate_limit?.secondary_window) {
-			const sw = data.rate_limit.secondary_window;
-			windows["week"] = {
-				usedPercent: sw.used_percent || 0,
-				resetAt: sw.reset_at ? new Date(sw.reset_at * 1000).getTime() : undefined,
+		if (primaryWindow) {
+			windows["primary"] = {
+				usedPercent: primaryWindow.used_percent || 0,
+				resetAt: primaryWindow.reset_at ? new Date(primaryWindow.reset_at * 1000).getTime() : undefined,
 			};
 		}
 
@@ -425,7 +423,7 @@ async function selectAccount(
 	const accounts = store.accounts;
 	const now = Date.now();
 
-	const candidates: { account: StoredAccount; index: number; weekPercent: number }[] = [];
+	const candidates: { account: StoredAccount; index: number; weekResetAt: number }[] = [];
 
 	for (let i = 0; i < accounts.length; i++) {
 		const acc = accounts[i];
@@ -437,27 +435,23 @@ async function selectAccount(
 		if (!refreshed?.access) continue;
 		if (tokenNeedsRefresh(refreshed)) continue;
 
-		const weekPercent = refreshed.usage?.windows["week"]?.usedPercent ?? 0;
-		candidates.push({ account: refreshed, index: i, weekPercent });
+		const weekResetAt = refreshed.usage?.windows["week"]?.resetAt ?? Infinity;
+		candidates.push({ account: refreshed, index: i, weekResetAt });
 	}
 
 	if (candidates.length === 0) return null;
 
-	candidates.sort((a, b) => a.weekPercent - b.weekPercent);
-
-	const topPercent = candidates[0].weekPercent;
-	const top = candidates.filter((c) => c.weekPercent === topPercent);
+	candidates.sort((a, b) => a.weekResetAt - b.weekResetAt);
 
 	let selected: { account: StoredAccount; index: number };
-	if (top.length > 1) {
-		const hashIdx = hashIndex(sessionKey, top.length);
-		selected = top[hashIdx];
+	if (candidates.length > 1 && candidates[0].weekResetAt === candidates[1].weekResetAt) {
+		const tied = candidates.filter((c) => c.weekResetAt === candidates[0].weekResetAt);
+		selected = tied[hashIndex(sessionKey, tied.length)];
 	} else {
 		selected = candidates[0];
 	}
 
-	let account = await refreshAccountIfNeeded(selected.index);
-	if (!account) return null;
+	let account = selected.account;
 
 	const usageAge = Date.now() - (account.usage?.fetchedAt ?? 0);
 	if (usageAge >= USAGE_STALE_MS) {
@@ -536,7 +530,6 @@ async function handleCommand(args: string, ctx: UIContext): Promise<void> {
 	const parts = (args || "").trim().split(/\s+/).filter(Boolean);
 	const subcommand = parts[0]?.toLowerCase();
 	const subArgs = parts.slice(1);
-	const sessionKey = getSessionKey(ctx);
 
 	switch (subcommand) {
 		case "add": {
@@ -838,102 +831,77 @@ function streamMultiProvider(
 	const stream = createAssistantMessageEventStream();
 
 	(async () => {
-		const store = loadStore();
-		const accounts = store.accounts;
-		const order = getAccountOrder(currentSessionKey, accounts.length);
-		const now = Date.now();
-		let lastError: any = null;
-
-		for (const index of order) {
-			const acc = accounts[index];
-			if (!acc?.access) continue;
-
-			if (acc.depleted && acc.depleted.until > now) continue;
-
-			const account = await refreshAccountIfNeeded(index);
-			if (!account?.access) continue;
-			if (tokenNeedsRefresh(account)) continue;
-
-			const apiKey = account.access;
-			const inner = streamSimple(
-				{
-					...model,
-					api: "openai-codex-responses" as Api,
-					provider: PROVIDER_CONFIG.provider,
-				} as any,
-				context,
-				{ ...options, apiKey },
-			);
-
-			const buffered: any[] = [];
-			let committed = false;
-
-			for await (const rawEvent of inner as any) {
-				const event = remapEvent(rawEvent, model);
-				if (!committed) {
-					if (event.type === "start") {
-						buffered.push(event);
-						continue;
-					}
-					if (event.type === "error") {
-						const errorMsg = event.error?.errorMessage ?? "";
-						const reason = parseRateLimitReason(errorMsg);
-						if (reason !== "UNKNOWN" || /429|rate.?limit/i.test(errorMsg)) {
-							const windowKey =
-								reason === "QUOTA_EXHAUSTED"
-									? "week"
-									: "primary";
-
-							let until = account.usage?.windows[windowKey]?.resetAt;
-							if (!until || until <= Date.now()) {
-								until = Date.now() + calculateRateLimitBackoffMs(reason);
-							}
-
-							markDepleted(index, {
-								window: windowKey,
-								until,
-								reason,
-							});
-						}
-						lastError = event;
-						break;
-					}
-					committed = true;
-					for (const pending of buffered) stream.push(pending);
-				}
-				stream.push(event);
-			}
-
-			if (committed) {
-				stream.end();
-				return;
-			}
-		}
-
-		if (lastError) {
-			stream.push(lastError);
+		const selected = await selectAccount(currentSessionKey);
+		if (!selected) {
+			stream.push({
+				type: "error",
+				reason: "error",
+				error: {
+					role: "assistant",
+					content: [],
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					usage: {
+						input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "error",
+					errorMessage: "No usable OpenAI Codex accounts",
+					timestamp: Date.now(),
+				},
+			});
 			stream.end();
 			return;
 		}
 
-		stream.push({
-			type: "error",
-			reason: "error",
-			error: {
-				role: "assistant",
-				content: [],
-				api: model.api,
-				provider: model.provider,
-				model: model.id,
-				usage: {
-					input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
-				stopReason: "error",
-				errorMessage: "No usable OpenAI Codex accounts",
-				timestamp: Date.now(),
-			},
-		});
+		const { account, index } = selected;
+		const apiKey = account.access;
+		const inner = streamSimple(
+			{
+				...model,
+				api: "openai-codex-responses" as Api,
+				provider: PROVIDER_CONFIG.provider,
+			} as any,
+			context,
+			{ ...options, apiKey },
+		);
+
+		const buffered: any[] = [];
+		let committed = false;
+
+		for await (const rawEvent of inner as any) {
+			const event = remapEvent(rawEvent, model);
+			if (!committed) {
+				if (event.type === "start") {
+					buffered.push(event);
+					continue;
+				}
+				if (event.type === "error") {
+					const errorMsg = event.error?.errorMessage ?? "";
+					const reason = parseRateLimitReason(errorMsg);
+					if (reason !== "UNKNOWN" || /429|rate.?limit/i.test(errorMsg)) {
+						const hasPrimary = "primary" in (account.usage?.windows ?? {});
+						const windowKey =
+							reason === "QUOTA_EXHAUSTED" || !hasPrimary ? "week" : "primary";
+
+						let until = account.usage?.windows[windowKey]?.resetAt;
+						if (!until || until <= Date.now()) {
+							until = Date.now() + calculateRateLimitBackoffMs(reason);
+						}
+
+						markDepleted(index, { window: windowKey, until, reason });
+					}
+					stream.push(event);
+					stream.end();
+					return;
+				}
+				committed = true;
+				for (const pending of buffered) stream.push(pending);
+			}
+			stream.push(event);
+		}
+
 		stream.end();
 	})();
 
