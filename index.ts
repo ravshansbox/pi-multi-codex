@@ -61,7 +61,7 @@ function parseRateLimitReason(errorMessage: string): RateLimitReason {
 		return "RATE_LIMIT_EXCEEDED";
 	}
 
-	if (lower.includes("exhausted") || lower.includes("quota") || lower.includes("usage limit")) {
+	if (lower.includes("exhausted") || lower.includes("quota") || lower.includes("usage limit") || lower.includes("usage_limit_reached")) {
 		return "QUOTA_EXHAUSTED";
 	}
 
@@ -423,22 +423,23 @@ async function selectAccount(
 	const accounts = store.accounts;
 	const now = Date.now();
 
-	const candidates: { account: StoredAccount; index: number; weekResetAt: number }[] = [];
+	const preferred: { account: StoredAccount; index: number; weekResetAt: number }[] = [];
+	const fallback: { account: StoredAccount; index: number; weekResetAt: number }[] = [];
 
 	for (let i = 0; i < accounts.length; i++) {
 		const acc = accounts[i];
 		if (!acc?.access) continue;
-
-		if (acc.depleted && acc.depleted.until > now) continue;
 
 		const refreshed = await refreshAccountIfNeeded(i);
 		if (!refreshed?.access) continue;
 		if (tokenNeedsRefresh(refreshed)) continue;
 
 		const weekResetAt = refreshed.usage?.windows["week"]?.resetAt ?? Infinity;
-		candidates.push({ account: refreshed, index: i, weekResetAt });
+		const depleted = acc.depleted && acc.depleted.until > now;
+		(depleted ? fallback : preferred).push({ account: refreshed, index: i, weekResetAt });
 	}
 
+	const candidates = preferred.length > 0 ? preferred : fallback;
 	if (candidates.length === 0) return null;
 
 	candidates.sort((a, b) => a.weekResetAt - b.weekResetAt);
@@ -885,7 +886,20 @@ function streamMultiProvider(
 						const windowKey =
 							reason === "QUOTA_EXHAUSTED" || !hasPrimary ? "week" : "primary";
 
-						let until = account.usage?.windows[windowKey]?.resetAt;
+						// Try to extract resets_at from the error JSON payload first
+						let until: number | undefined;
+						try {
+							const jsonMatch = errorMsg.match(/\{.*\}/s);
+							if (jsonMatch) {
+								const parsed = JSON.parse(jsonMatch[0]);
+								const resetsAt = parsed?.error?.resets_at ?? parsed?.resets_at;
+								if (resetsAt) until = resetsAt * 1000;
+							}
+						} catch { /* ignore */ }
+
+						if (!until || until <= Date.now()) {
+							until = account.usage?.windows[windowKey]?.resetAt;
+						}
 						if (!until || until <= Date.now()) {
 							until = Date.now() + calculateRateLimitBackoffMs(reason);
 						}
