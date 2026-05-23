@@ -944,6 +944,12 @@ function remapEvent(event: any, model: Model<Api>) {
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		currentSessionKey = getSessionKey(ctx as UIContext);
+		const store = loadStore();
+		for (let i = 0; i < store.accounts.length; i++) {
+			const acc = store.accounts[i];
+			if (!acc?.access) continue;
+			refreshUsage(i, acc).catch(() => {});
+		}
 	});
 
 	pi.on("before_agent_start", async (_event, ctx) => {
