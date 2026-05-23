@@ -434,9 +434,17 @@ async function selectAccount(
 		if (!refreshed?.access) continue;
 		if (tokenNeedsRefresh(refreshed)) continue;
 
-		const weekResetAt = refreshed.usage?.windows["week"]?.resetAt ?? Infinity;
-		const depleted = acc.depleted && acc.depleted.until > now;
-		(depleted ? fallback : preferred).push({ account: refreshed, index: i, weekResetAt });
+		const usageAge = Date.now() - (refreshed.usage?.fetchedAt ?? 0);
+		if (usageAge >= USAGE_STALE_MS) {
+			await refreshUsage(i, refreshed);
+			const updated = loadStore().accounts[i];
+			if (updated) accounts[i] = updated;
+		}
+
+		const latest = accounts[i];
+		const weekResetAt = latest.usage?.windows["week"]?.resetAt ?? Infinity;
+		const depleted = latest.depleted && latest.depleted.until > now;
+		(depleted ? fallback : preferred).push({ account: latest, index: i, weekResetAt });
 	}
 
 	const candidates = preferred.length > 0 ? preferred : fallback;
@@ -452,16 +460,7 @@ async function selectAccount(
 		selected = candidates[0];
 	}
 
-	let account = selected.account;
-
-	const usageAge = Date.now() - (account.usage?.fetchedAt ?? 0);
-	if (usageAge >= USAGE_STALE_MS) {
-		await refreshUsage(selected.index, account);
-		const updatedStore = loadStore();
-		account = updatedStore.accounts[selected.index] ?? account;
-	}
-
-	return { account, index: selected.index };
+	return { account: selected.account, index: selected.index };
 }
 
 // =============================================================================
