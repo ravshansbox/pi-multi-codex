@@ -2,29 +2,18 @@
  * Multi-Codex Extension
  *
  * Stores multiple OpenAI Codex OAuth tokens in auth.json as "openai-codex-N".
- * Switching copies the chosen token to the "openai-codex" key.
+ * No state file — everything lives in auth.json.
+ * Usage is fetched live on list. Email is cached at add time.
+ * Active account = whichever token is under the "openai-codex" key.
  */
 
 import { loginOpenAICodex } from "@earendil-works/pi-ai/oauth";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
 
-const ST = path.join(os.homedir(), ".pi", "agent", "multi-codex-state.json");
 const PF = "openai-codex-";
 const ACT = "openai-codex";
 const TO = 10000;
-const STALE = 5 * 60 * 1000;
-
-interface St { email?: string; active?: boolean; usage?: { at: number; w: Record<string, { pct: number; reset?: number }> }; }
-type Store = Record<string, St>;
-
-const store = {
-	load(): Store { try { return fs.existsSync(ST) ? JSON.parse(fs.readFileSync(ST, "utf-8")) : {}; } catch { return {}; } },
-	save(s: Store) { fs.mkdirSync(path.dirname(ST), { recursive: true }); fs.writeFileSync(ST, JSON.stringify(s)); },
-};
 
 async function usage(ak: string) {
 	try {
@@ -39,7 +28,7 @@ async function usage(ak: string) {
 		const ww = rw[rw.length - 1], pw = rw.length > 1 ? rw[0] : undefined;
 		if (ww) w["week"] = { pct: ww.used_percent || 0, reset: ww.reset_at ? ww.reset_at * 1000 : undefined };
 		if (pw) w["primary"] = { pct: pw.used_percent || 0, reset: pw.reset_at ? pw.reset_at * 1000 : undefined };
-		return { w };
+		return { w, plan: d.plan_type };
 	} catch { return null; }
 }
 
@@ -53,11 +42,29 @@ async function profile(ak: string) {
 function pn(n: number) { return `${PF}${n}`; }
 
 // ---------------------------------------------------------------------------
+// Auth helpers — everything in auth.json
+// ---------------------------------------------------------------------------
+
+function getAccounts(as: any): string[] {
+	return (as.list?.() ?? []).filter((k: string) => k.startsWith(PF)).sort();
+}
+
+function getActive(as: any): string | undefined {
+	const cred = as.get(ACT);
+	if (!cred) return undefined;
+	for (const k of getAccounts(as)) {
+		const v = as.get(k);
+		if (v && v.type === cred.type && v.access === cred.access) return k;
+	}
+	return undefined;
+}
+
+// ---------------------------------------------------------------------------
 // TUI list
 // ---------------------------------------------------------------------------
 
 interface Row {
-	i: number; email: string; win: Array<{ n: string; pct: number; reset?: number; clr: string }>; err?: string; active: boolean;
+	key: string; i: number; email: string; plan?: string; win: Array<{ n: string; pct: number; reset?: number; clr: string }>; err?: string; active: boolean;
 }
 
 class List {
@@ -79,28 +86,26 @@ class List {
 	private a(s: string) { return this.th.fg("accent", s); }
 
 	private async init() {
-		const s = store.load();
+		const as = this.ctx.modelRegistry.authStorage;
+		const accounts = getAccounts(as);
+		const activeKey = getActive(as);
 		const rs: Row[] = [];
-		for (const [k, st] of Object.entries(s).sort()) {
-			if (!k.startsWith(PF)) continue;
+
+		for (const k of accounts) {
 			const i = parseInt(k.slice(PF.length), 10);
-			const ak = await this.ctx.modelRegistry.authStorage.getApiKey(k);
-			if (!ak) { delete s[k]; continue; }
+			const v = as.get(k);
+			if (!v) continue;
 
-			let w = st.usage?.w;
-			if (!st.usage || Date.now() - st.usage.at > STALE) {
-				const u = await usage(ak);
-				if (u) { w = u.w; s[k].usage = { at: Date.now(), w: u.w }; }
-			}
-
+			const u = await usage(v.access);
+			const plan = (u as any)?.plan;
 			const wins: Row["win"] = [];
-			if (w) for (const [wn, wd] of Object.entries(w).sort((a, b) => ({ week: 0, primary: 1 } as any)[a[0]] - ({ week: 0, primary: 1 } as any)[b[0]])) {
+			if (u?.w) for (const [wn, wd] of Object.entries(u.w).sort((a, b) => ({ week: 0, primary: 1 } as any)[a[0]] - ({ week: 0, primary: 1 } as any)[b[0]])) {
 				const rem = 100 - wd.pct;
 				wins.push({ n: wn, pct: wd.pct, reset: wd.reset, clr: rem <= 10 ? "error" : rem <= 30 ? "warning" : "success" });
 			}
-			rs.push({ i, email: st.email ?? "unknown", win: wins, err: w ? undefined : "fetch failed", active: !!st.active });
+			rs.push({ key: k, i, email: v.email ?? "unknown", plan, win: wins, err: u ? undefined : "fetch failed", active: k === activeKey });
 		}
-		store.save(s);
+
 		this.rs = rs;
 		const ai = rs.findIndex(r => r.active);
 		if (ai >= 0) this.sel = ai;
@@ -113,33 +118,64 @@ class List {
 		if (matchesKey(ev, "up") || ev === "k") { this.sel = Math.max(0, this.sel - 1); this.tu.requestRender(); return; }
 		if (matchesKey(ev, "down") || ev === "j") { this.sel = Math.min(this.rs.length - 1, this.sel + 1); this.tu.requestRender(); return; }
 		if (matchesKey(ev, "enter")) { void this.withBusy("switch", () => this.doSwitch()); return; }
+		if (ev === "a") { void this.withBusy("add", () => this.doAdd()); return; }
 		if (matchesKey(ev, "backspace") || matchesKey(ev, "delete")) { void this.withBusy("remove", () => this.doRemove()); }
 	}
 
 	private async withBusy(label: string, fn: () => Promise<void>) {
 		this.busy = label; this.tu.requestRender();
-		try { await fn(); }
-		catch { this.busy = ""; this.tu.requestRender(); }
+		try { await fn(); } catch { this.busy = ""; this.tu.requestRender(); }
 	}
 
 	private async doSwitch() {
 		const r = this.rs[this.sel]; if (!r) return;
-		const s = store.load();
-		for (const k of Object.keys(s)) if (k.startsWith(PF)) s[k].active = false;
-		s[pn(r.i)] = { ...s[pn(r.i)], active: true };
-		store.save(s);
-		const cred = this.ctx.modelRegistry.authStorage.get(pn(r.i));
-		if (cred) this.ctx.modelRegistry.authStorage.set(ACT, cred);
+		const as = this.ctx.modelRegistry.authStorage;
+		const cred = as.get(r.key);
+		if (cred) as.set(ACT, cred);
 		this.done();
+	}
+
+	private async doAdd() {
+		try {
+			const creds = await loginOpenAICodex({
+				onAuth: ({ url, instructions }) => {
+					this.ctx.ui.notify(`Open: ${url}`, "info");
+					if (instructions) this.ctx.ui.notify(instructions, "info");
+					void import("node:child_process").then(({ exec }) => {
+						exec(process.platform === "darwin" ? `open '${url}'` : process.platform === "win32" ? `start "" "${url}"` : `xdg-open '${url}'`);
+					});
+				},
+				onPrompt: async ({ message }) => {
+					const v = await this.ctx.ui.input(message);
+					if (!v?.trim()) throw new Error("Cancelled");
+					return v.trim();
+				},
+				onProgress: (msg: string) => this.ctx.ui.notify(msg, "info"),
+				originator: "pi",
+			});
+
+			const as = this.ctx.modelRegistry.authStorage;
+
+			let idx = 0;
+			for (const k of as.list()) {
+				if (k.startsWith(PF)) { const n = parseInt(k.slice(PF.length), 10); if (!isNaN(n) && n >= idx) idx = n + 1; }
+			}
+
+			const em = await profile(creds.access);
+
+			as.set(pn(idx), { type: "oauth", ...creds, email: em });
+			as.set(ACT, { type: "oauth", ...creds });
+
+			this.ctx.ui.notify(`Added & switched to [${idx}]${em ? ` (${em})` : ""}`, "success");
+		} catch (e: any) { this.ctx.ui.notify(`Failed: ${e?.message || e}`, "error"); }
+		this.busy = ""; this.loading = true; void this.init().then(() => { this.tu.requestRender(); });
 	}
 
 	private async doRemove() {
 		const r = this.rs[this.sel]; if (!r) return;
-		const s = store.load();
-		delete s[pn(r.i)];
-		if (r.active) this.ctx.modelRegistry.authStorage.remove(ACT);
-		this.ctx.modelRegistry.authStorage.remove(pn(r.i));
-		store.save(s);
+		const as = this.ctx.modelRegistry.authStorage;
+		if (r.active) as.remove(ACT);
+		as.remove(r.key);
 		this.busy = ""; this.loading = true; void this.init().then(() => { this.sel = Math.min(this.sel, this.rs.length - 1); this.tu.requestRender(); });
 	}
 
@@ -152,19 +188,19 @@ class List {
 		const l: string[] = [];
 
 		if (this.busy) {
-			const act = this.busy === "switch" ? "switching" : "removing";
 			l.push(this.d(`╭${hl}╮`), bx(this.b(this.a("multi-codex"))), this.d(`├${hl}┤`));
-			l.push(bx(`${act} [${this.rs[this.sel]?.i}] ${this.rs[this.sel]?.email}...`));
+			l.push(bx(`${this.busy}...`));
 			l.push(this.d(`╰${hl}╯`)); return l;
 		}
 
 		l.push(this.d(`╭${hl}╮`), bx(this.b(this.a("multi-codex"))), this.d(`├${hl}┤`));
 
 		if (this.loading) l.push(bx("loading..."));
-		else if (!this.rs.length) { l.push(bx("no accounts"), bx(""), bx(this.d("/multi-codex add"))); }
+		else if (!this.rs.length) { l.push(bx("no accounts"), bx(""), bx(this.d("a  add account"))); }
 		else for (let i = 0; i < this.rs.length; i++) {
 			const r = this.rs[i];
-			l.push(bx(`${i === this.sel ? t.fg("accent", "▸ ") : "  "}${this.b(`[${r.i}]`)} ${r.email}${r.active ? t.fg("success", " ●") : ""}`));
+			const planLabel = r.plan && r.plan !== "free" ? t.fg("accent", ` ${r.plan}`) : "";
+			l.push(bx(`${i === this.sel ? t.fg("accent", "▸ ") : "  "}${this.b(`[${r.i}]`)} ${r.email}${planLabel}${r.active ? t.fg("success", " ●") : ""}`));
 			if (r.err) { l.push(bx(this.d(`   ${r.err}`))); continue; }
 			for (const w of r.win) {
 				const f = Math.min(10, Math.round(w.pct / 10)), e = 10 - f;
@@ -174,7 +210,7 @@ class List {
 			}
 		}
 
-		l.push(this.d(`├${hl}┤`), bx(this.d("↑↓ select  ↵ switch  ⌫ remove  esc close")), this.d(`╰${hl}╯`));
+		l.push(this.d(`├${hl}┤`), bx(this.d("↑↓ select  a add  ↵ switch  ⌫ remove  esc close")), this.d(`╰${hl}╯`));
 		return l;
 	}
 }
@@ -193,60 +229,8 @@ function fmt(d: Date): string {
 export default function (pi: ExtensionAPI) {
 	pi.registerCommand("multi-codex", {
 		description: "Manage multiple OpenAI Codex accounts",
-		getArgumentCompletions(pref: string) {
-			const p = pref.trimStart().split(/\s+/).filter(Boolean);
-			if (!p.length) return [{ value: "list", label: "list" }, { value: "add", label: "add" }];
-			if (p.length === 1 && !pref.endsWith(" "))
-				return ["list", "add"].filter(s => s.startsWith(p[0])).map(s => ({ value: s, label: s }));
-			return null;
-		},
-		handler: async (args, ctx) => {
-			const p = (args || "").trim().split(/\s+/).filter(Boolean);
-			const sub = p[0]?.toLowerCase();
-
-			if (sub === "add") {
-				try {
-					const creds = await loginOpenAICodex({
-						onAuth: ({ url, instructions }) => {
-							ctx.ui.notify(`Open: ${url}`, "info");
-							if (instructions) ctx.ui.notify(instructions, "info");
-							void import("node:child_process").then(({ exec }) => {
-								exec(process.platform === "darwin" ? `open '${url}'` : process.platform === "win32" ? `start "" "${url}"` : `xdg-open '${url}'`);
-							});
-						},
-						onPrompt: async ({ message }) => {
-							const v = await ctx.ui.input(message);
-							if (!v?.trim()) throw new Error("Cancelled");
-							return v.trim();
-						},
-						onProgress: (msg: string) => ctx.ui.notify(msg, "info"),
-						originator: "pi",
-					});
-
-					let idx = 0;
-					for (const k of ctx.modelRegistry.authStorage.list()) {
-						if (k.startsWith(PF)) { const n = parseInt(k.slice(PF.length), 10); if (!isNaN(n) && n >= idx) idx = n + 1; }
-					}
-
-					ctx.modelRegistry.authStorage.set(pn(idx), { type: "oauth", ...creds });
-					const em = await profile(creds.access);
-					const s = store.load();
-					for (const k of Object.keys(s)) if (k.startsWith(PF)) s[k].active = false;
-					s[pn(idx)] = { email: em, active: true };
-					store.save(s);
-
-					ctx.modelRegistry.authStorage.set(ACT, { type: "oauth", ...creds });
-					ctx.ui.notify(`Added & switched to [${idx}]${em ? ` (${em})` : ""}`, "success");
-				} catch (e: any) { ctx.ui.notify(`Failed: ${e?.message || e}`, "error"); }
-				return;
-			}
-
-			if (sub === "list" || !sub) {
-				await ctx.ui.custom((tu: any, th: any, _kb: any, done: () => void) => new List(tu, th, done, ctx));
-				return;
-			}
-
-			ctx.ui.notify("/multi-codex add    Add account\n/multi-codex list   List (↑↓ ↵ switch, ⌫ remove)", "info");
+		handler: async (_args, ctx) => {
+			await ctx.ui.custom((tu: any, th: any, _kb: any, done: () => void) => new List(tu, th, done, ctx));
 		},
 	});
 }
