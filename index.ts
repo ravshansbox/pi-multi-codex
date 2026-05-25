@@ -33,7 +33,18 @@ async function fetchUsage(ak: string) {
 	} catch { return null; }
 }
 
+function parseEmailFromJwt(ak: string): string | undefined {
+	try {
+		const payload = ak.split(".")[1];
+		if (!payload) return undefined;
+		const decoded = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+		return decoded?.["https://api.openai.com/profile"]?.email as string | undefined;
+	} catch { return undefined; }
+}
+
 async function fetchProfile(ak: string) {
+	const email = parseEmailFromJwt(ak);
+	if (email) return email;
 	try {
 		const r = await fetch("https://api.openai.com/v1/me", { headers: { Authorization: `Bearer ${ak}` }, signal: AbortSignal.timeout(TO) });
 		return r.ok ? ((await r.json()) as any)?.email as string | undefined : undefined;
