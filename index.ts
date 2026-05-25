@@ -2,8 +2,7 @@
  * Multi-Codex Extension
  *
  * Stores multiple OpenAI Codex OAuth tokens in auth.json as "openai-codex-N".
- * No state file — everything lives in auth.json.
- * Usage is fetched live on list. Email is cached at add time.
+ * No state file, no cached metadata — everything fetched live.
  * Active account = whichever token is under the "openai-codex" key.
  */
 
@@ -15,7 +14,7 @@ const PF = "openai-codex-";
 const ACT = "openai-codex";
 const TO = 10000;
 
-async function usage(ak: string) {
+async function fetchUsage(ak: string) {
 	try {
 		const r = await fetch("https://chatgpt.com/backend-api/wham/usage", {
 			headers: { Authorization: `Bearer ${ak}`, "User-Agent": "pi-agent", Accept: "application/json" },
@@ -28,11 +27,13 @@ async function usage(ak: string) {
 		const ww = rw[rw.length - 1], pw = rw.length > 1 ? rw[0] : undefined;
 		if (ww) w["week"] = { pct: ww.used_percent || 0, reset: ww.reset_at ? ww.reset_at * 1000 : undefined };
 		if (pw) w["primary"] = { pct: pw.used_percent || 0, reset: pw.reset_at ? pw.reset_at * 1000 : undefined };
-		return { w, plan: d.plan_type };
+		let plan: string | undefined;
+		if (d.plan_type && d.plan_type !== "free") plan = d.plan_type;
+		return { w, plan };
 	} catch { return null; }
 }
 
-async function profile(ak: string) {
+async function fetchProfile(ak: string) {
 	try {
 		const r = await fetch("https://api.openai.com/v1/me", { headers: { Authorization: `Bearer ${ak}` }, signal: AbortSignal.timeout(TO) });
 		return r.ok ? ((await r.json()) as any)?.email as string | undefined : undefined;
@@ -96,14 +97,13 @@ class List {
 			const v = as.get(k);
 			if (!v) continue;
 
-			const u = await usage(v.access);
-			const plan = (u as any)?.plan;
+			const [u, p] = await Promise.all([fetchUsage(v.access), fetchProfile(v.access)]);
 			const wins: Row["win"] = [];
 			if (u?.w) for (const [wn, wd] of Object.entries(u.w).sort((a, b) => ({ week: 0, primary: 1 } as any)[a[0]] - ({ week: 0, primary: 1 } as any)[b[0]])) {
 				const rem = 100 - wd.pct;
 				wins.push({ n: wn, pct: wd.pct, reset: wd.reset, clr: rem <= 10 ? "error" : rem <= 30 ? "warning" : "success" });
 			}
-			rs.push({ key: k, i, email: v.email ?? "unknown", plan, win: wins, err: u ? undefined : "fetch failed", active: k === activeKey });
+			rs.push({ key: k, i, email: p ?? "unknown", plan: u?.plan, win: wins, err: u ? undefined : "fetch failed", active: k === activeKey });
 		}
 
 		this.rs = rs;
@@ -161,12 +161,10 @@ class List {
 				if (k.startsWith(PF)) { const n = parseInt(k.slice(PF.length), 10); if (!isNaN(n) && n >= idx) idx = n + 1; }
 			}
 
-			const em = await profile(creds.access);
-
-			as.set(pn(idx), { type: "oauth", ...creds, email: em });
+			as.set(pn(idx), { type: "oauth", ...creds });
 			as.set(ACT, { type: "oauth", ...creds });
 
-			this.ctx.ui.notify(`Added & switched to [${idx}]${em ? ` (${em})` : ""}`, "success");
+			this.ctx.ui.notify(`Added & switched to [${idx}]`, "success");
 		} catch (e: any) { this.ctx.ui.notify(`Failed: ${e?.message || e}`, "error"); }
 		this.busy = ""; this.loading = true; void this.init().then(() => { this.tu.requestRender(); });
 	}
@@ -199,7 +197,7 @@ class List {
 		else if (!this.rs.length) { l.push(bx("no accounts"), bx(""), bx(this.d("a  add account"))); }
 		else for (let i = 0; i < this.rs.length; i++) {
 			const r = this.rs[i];
-			const planLabel = r.plan && r.plan !== "free" ? t.fg("accent", ` ${r.plan}`) : "";
+			const planLabel = r.plan ? t.fg("accent", ` ${r.plan}`) : "";
 			l.push(bx(`${i === this.sel ? t.fg("accent", "▸ ") : "  "}${this.b(`[${r.i}]`)} ${r.email}${planLabel}${r.active ? t.fg("success", " ●") : ""}`));
 			if (r.err) { l.push(bx(this.d(`   ${r.err}`))); continue; }
 			for (const w of r.win) {
