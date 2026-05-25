@@ -1,985 +1,252 @@
 /**
- * Multi-Codex Provider Extension
+ * Multi-Codex Extension
  *
- * Manages multiple OpenAI Codex accounts with smart routing based on
- * usage limits.
- *
- * Commands:
- *   /multi-codex add          Add OpenAI Codex account
- *   /multi-codex list         List accounts with usage
- *   /multi-codex remove <index>  Remove account
- *   /multi-codex usage        Show usage stats
+ * Stores multiple OpenAI Codex OAuth tokens in auth.json as "openai-codex-N".
+ * Switching copies the chosen token to the "openai-codex" key.
  */
 
-import {
-	type Api,
-	type AssistantMessageEventStream,
-	type Context,
-	createAssistantMessageEventStream,
-	type Model,
-	type SimpleStreamOptions,
-	streamSimple,
-} from "@earendil-works/pi-ai";
-import { loginOpenAICodex, refreshOpenAICodexToken } from "@earendil-works/pi-ai/oauth";
+import { loginOpenAICodex } from "@earendil-works/pi-ai/oauth";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { matchesKey } from "@earendil-works/pi-tui";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { createHash } from "node:crypto";
-import { exec } from "node:child_process";
-import { matchesKey } from "@earendil-works/pi-tui";
 
-// =============================================================================
-// Rate Limit Classification
-// =============================================================================
+const ST = path.join(os.homedir(), ".pi", "agent", "multi-codex-state.json");
+const PF = "openai-codex-";
+const ACT = "openai-codex";
+const TO = 10000;
+const STALE = 5 * 60 * 1000;
 
-type RateLimitReason =
-	| "QUOTA_EXHAUSTED"
-	| "RATE_LIMIT_EXCEEDED"
-	| "MODEL_CAPACITY_EXHAUSTED"
-	| "SERVER_ERROR"
-	| "UNKNOWN";
+interface St { email?: string; active?: boolean; usage?: { at: number; w: Record<string, { pct: number; reset?: number }> }; }
+type Store = Record<string, St>;
 
-function parseRateLimitReason(errorMessage: string): RateLimitReason {
-	const lower = errorMessage.toLowerCase();
+const store = {
+	load(): Store { try { return fs.existsSync(ST) ? JSON.parse(fs.readFileSync(ST, "utf-8")) : {}; } catch { return {}; } },
+	save(s: Store) { fs.mkdirSync(path.dirname(ST), { recursive: true }); fs.writeFileSync(ST, JSON.stringify(s)); },
+};
 
-	if (
-		lower.includes("capacity") ||
-		lower.includes("overloaded") ||
-		lower.includes("529") ||
-		lower.includes("503") ||
-		lower.includes("resource exhausted")
-	) {
-		return "MODEL_CAPACITY_EXHAUSTED";
-	}
-
-	if (
-		lower.includes("per minute") ||
-		lower.includes("rate limit") ||
-		lower.includes("too many requests")
-	) {
-		return "RATE_LIMIT_EXCEEDED";
-	}
-
-	if (lower.includes("exhausted") || lower.includes("quota") || lower.includes("usage limit") || lower.includes("usage_limit_reached")) {
-		return "QUOTA_EXHAUSTED";
-	}
-
-	if (lower.includes("500") || lower.includes("internal error")) {
-		return "SERVER_ERROR";
-	}
-
-	return "UNKNOWN";
-}
-
-function calculateRateLimitBackoffMs(reason: RateLimitReason): number {
-	switch (reason) {
-		case "QUOTA_EXHAUSTED":
-			return 30 * 60 * 1000; // 30 min
-		case "RATE_LIMIT_EXCEEDED":
-			return 30 * 1000; // 30s
-		case "MODEL_CAPACITY_EXHAUSTED":
-			return 45 * 1000 + Math.random() * 30 * 1000; // 45-75s with jitter
-		case "SERVER_ERROR":
-			return 20 * 1000; // 20s
-		default:
-			return 30 * 60 * 1000; // conservative default: 30 min
-	}
-}
-
-// =============================================================================
-// Constants
-// =============================================================================
-
-const STORE_PATH = path.join(os.homedir(), ".pi", "agent", "multi-codex-auth.json");
-const STORE_LOCK_PATH = `${STORE_PATH}.lock`;
-const EXPIRY_SKEW_MS = 60_000;
-const LOCK_STALE_MS = 2 * 60_000;
-const USAGE_STALE_MS = 5 * 60 * 1000; // 5 minutes
-const FETCH_TIMEOUT_MS = 10000;
-
-const PROVIDER_CONFIG = {
-	provider: "openai-codex-multi",
-	api: "openai-codex-multi-api" as Api,
-	baseUrl: "https://chatgpt.com/backend-api",
-	models: [
-		{
-			id: "gpt-5.3-codex",
-			name: "GPT-5.3 Codex",
-			reasoning: true,
-			input: ["text", "image"] as const,
-			cost: { input: 1.75, output: 14, cacheRead: 0.175, cacheWrite: 0 },
-			contextWindow: 400000,
-			maxTokens: 128000,
-		},
-		{
-			id: "gpt-5.4",
-			name: "GPT-5.4",
-			reasoning: true,
-			input: ["text", "image"] as const,
-			cost: { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 },
-			contextWindow: 1050000,
-			maxTokens: 128000,
-		},
-		{
-			id: "gpt-5.5",
-			name: "GPT-5.5",
-			reasoning: true,
-			input: ["text", "image"] as const,
-			cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 },
-			contextWindow: 1050000,
-			maxTokens: 128000,
-		},
-	],
-} as const;
-
-// =============================================================================
-// Types
-// =============================================================================
-
-interface StoredAccount {
-	access: string;
-	refresh?: string;
-	expires?: number;
-	email?: string;
-	addedAt: number;
-	lastRefreshedAt?: number;
-	usage?: {
-		fetchedAt: number;
-		windows: Record<string, { usedPercent: number; resetAt?: number }>;
-	};
-	depleted?: {
-		until: number;
-		reason: RateLimitReason;
-		window: string;
-	};
-}
-
-interface UsageSnapshot {
-	index: number;
-	email?: string;
-	plan?: string;
-	windows: Record<string, { usedPercent: number; resetAt?: number }>;
-	error?: string;
-}
-
-interface UIContext {
-	ui: any;
-	cwd: string;
-	sessionManager: any;
-}
-
-type AccountStore = { accounts: StoredAccount[] };
-
-// =============================================================================
-// Store Management
-// =============================================================================
-
-function ensureDir(p: string): void {
-	fs.mkdirSync(path.dirname(p), { recursive: true });
-}
-
-function loadStore(): AccountStore {
+async function usage(ak: string) {
 	try {
-		if (fs.existsSync(STORE_PATH)) {
-			const raw = JSON.parse(fs.readFileSync(STORE_PATH, "utf-8")) as any;
-			const store: AccountStore = raw.accounts ? raw : { accounts: [] };
-			// Clean up expired depleted entries
-			const now = Date.now();
-			for (const acc of store.accounts) {
-				if (acc.depleted && acc.depleted.until <= now) {
-					delete acc.depleted;
-				}
-			}
-			return store;
-		}
-	} catch {
-		// ignore
-	}
-	return { accounts: [] };
-}
-
-function saveStore(store: AccountStore): void {
-	ensureDir(STORE_PATH);
-	fs.writeFileSync(STORE_PATH, JSON.stringify(store, null, 2));
-}
-
-function sleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function withStoreLock<T>(fn: () => Promise<T>): Promise<T> {
-	ensureDir(STORE_PATH);
-
-	for (let attempt = 0; attempt < 100; attempt++) {
-		try {
-			fs.mkdirSync(STORE_LOCK_PATH);
-			try {
-				return await fn();
-			} finally {
-				fs.rmSync(STORE_LOCK_PATH, { recursive: true, force: true });
-			}
-		} catch (error: any) {
-			if (error?.code !== "EEXIST") throw error;
-
-			try {
-				const stat = fs.statSync(STORE_LOCK_PATH);
-				if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
-					fs.rmSync(STORE_LOCK_PATH, { recursive: true, force: true });
-					continue;
-				}
-			} catch {
-				// Lock disappeared between attempts; retry immediately.
-				continue;
-			}
-
-			await sleep(50 + Math.random() * 100);
-		}
-	}
-
-	throw new Error("Timed out waiting for multi-codex auth lock");
-}
-
-function tokenNeedsRefresh(account: StoredAccount, now = Date.now()): boolean {
-	return !account.expires || account.expires - EXPIRY_SKEW_MS <= now;
-}
-
-function markDepleted(index: number, entry: { until: number; reason: RateLimitReason; window: string }): void {
-	const store = loadStore();
-	if (index >= 0 && index < store.accounts.length) {
-		store.accounts[index].depleted = entry;
-		saveStore(store);
-	}
-}
-
-// =============================================================================
-// Session Key
-// =============================================================================
-
-let currentSessionKey = "no-session";
-
-function getSessionKey(ctx: UIContext): string {
-	return ctx.sessionManager?.getSessionFile?.() ?? ctx.sessionManager?.getLeafId?.() ?? `ephemeral:${ctx.cwd}`;
-}
-
-function hashIndex(sessionKey: string, accountCount: number): number {
-	if (accountCount <= 0) return 0;
-	const digest = createHash("sha256").update(sessionKey).digest();
-	return digest.readUInt32BE(0) % accountCount;
-}
-
-// =============================================================================
-// Token Management
-// =============================================================================
-
-async function refreshAccountIfNeeded(index: number): Promise<StoredAccount | null> {
-	const initialStore = loadStore();
-	const initialAccount = initialStore.accounts[index];
-	if (!initialAccount) return null;
-	if (!tokenNeedsRefresh(initialAccount)) return initialAccount;
-	if (!initialAccount.refresh) return initialAccount.access ? initialAccount : null;
-
-	try {
-		return await withStoreLock(async () => {
-			const store = loadStore();
-			const account = store.accounts[index];
-			if (!account) return null;
-
-			// Another pi instance may have refreshed while we waited for the lock.
-			if (!tokenNeedsRefresh(account)) return account;
-			if (!account.refresh) return account.access ? account : null;
-
-			const refreshed = await refreshOpenAICodexToken(account.refresh);
-			const updated: StoredAccount = {
-				...account,
-				access: refreshed.access,
-				refresh: refreshed.refresh || account.refresh,
-				expires: refreshed.expires,
-				lastRefreshedAt: Date.now(),
-			};
-
-			store.accounts[index] = updated;
-			saveStore(store);
-			return updated;
+		const r = await fetch("https://chatgpt.com/backend-api/wham/usage", {
+			headers: { Authorization: `Bearer ${ak}`, "User-Agent": "pi-agent", Accept: "application/json" },
+			signal: AbortSignal.timeout(TO),
 		});
-	} catch {
-		// Match pi's behavior: after a refresh failure, reload in case another
-		// process refreshed successfully. Otherwise preserve credentials for retry.
-		const store = loadStore();
-		const account = store.accounts[index];
-		if (account && !tokenNeedsRefresh(account)) return account;
-		return null;
-	}
+		if (!r.ok) return null;
+		const d = (await r.json()) as any;
+		const w: Record<string, { pct: number; reset?: number }> = {};
+		const rw = [d.rate_limit?.primary_window, d.rate_limit?.secondary_window].filter(Boolean);
+		const ww = rw[rw.length - 1], pw = rw.length > 1 ? rw[0] : undefined;
+		if (ww) w["week"] = { pct: ww.used_percent || 0, reset: ww.reset_at ? ww.reset_at * 1000 : undefined };
+		if (pw) w["primary"] = { pct: pw.used_percent || 0, reset: pw.reset_at ? pw.reset_at * 1000 : undefined };
+		return { w };
+	} catch { return null; }
 }
 
-// =============================================================================
-// Usage Fetching
-// =============================================================================
-
-async function fetchWithTimeout(url: string, init?: RequestInit): Promise<Response> {
-	const controller = new AbortController();
-	const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+async function profile(ak: string) {
 	try {
-		return await fetch(url, { ...init, signal: controller.signal });
-	} finally {
-		clearTimeout(timer);
-	}
+		const r = await fetch("https://api.openai.com/v1/me", { headers: { Authorization: `Bearer ${ak}` }, signal: AbortSignal.timeout(TO) });
+		return r.ok ? ((await r.json()) as any)?.email as string | undefined : undefined;
+	} catch { return undefined; }
 }
 
-async function fetchUsage(account: StoredAccount): Promise<{ windows: Record<string, { usedPercent: number; resetAt?: number }>; email?: string; plan?: string } | null> {
-	try {
-		const headers: Record<string, string> = {
-			Authorization: `Bearer ${account.access}`,
-			"User-Agent": "pi-agent",
-			Accept: "application/json",
-		};
-		if ((account as any).accountId) {
-			headers["ChatGPT-Account-Id"] = (account as any).accountId;
-		}
+function pn(n: number) { return `${PF}${n}`; }
 
-		const res = await fetchWithTimeout("https://chatgpt.com/backend-api/wham/usage", {
-			headers,
-		});
+// ---------------------------------------------------------------------------
+// TUI list
+// ---------------------------------------------------------------------------
 
-		if (!res.ok) return null;
-
-		const data = (await res.json()) as any;
-		const windows: Record<string, { usedPercent: number; resetAt?: number }> = {};
-
-		const rawWindows = [
-			data.rate_limit?.primary_window,
-			data.rate_limit?.secondary_window,
-		].filter(Boolean);
-
-		const weeklyWindow = rawWindows[rawWindows.length - 1];
-		const primaryWindow = rawWindows.length > 1 ? rawWindows[0] : undefined;
-
-		if (weeklyWindow) {
-			windows["week"] = {
-				usedPercent: weeklyWindow.used_percent || 0,
-				resetAt: weeklyWindow.reset_at ? new Date(weeklyWindow.reset_at * 1000).getTime() : undefined,
-			};
-		}
-
-		if (primaryWindow) {
-			windows["primary"] = {
-				usedPercent: primaryWindow.used_percent || 0,
-				resetAt: primaryWindow.reset_at ? new Date(primaryWindow.reset_at * 1000).getTime() : undefined,
-			};
-		}
-
-		let plan = data.plan_type;
-		if (data.credits?.balance !== undefined && data.credits.balance !== null) {
-			const balance = typeof data.credits.balance === "number" ? data.credits.balance : parseFloat(data.credits.balance) || 0;
-			if (balance > 0) plan = plan ? `${plan} ($${balance.toFixed(2)})` : `$${balance.toFixed(2)}`;
-		}
-
-		// Fetch email
-		let email: string | undefined;
-		try {
-			const meRes = await fetchWithTimeout("https://api.openai.com/v1/me", {
-				headers: { Authorization: `Bearer ${account.access}` },
-			});
-			if (meRes.ok) {
-				const me = (await meRes.json()) as any;
-				email = me?.email;
-			}
-		} catch {
-			// ignore
-		}
-
-		return { windows, email, plan };
-	} catch {
-		return null;
-	}
+interface Row {
+	i: number; email: string; win: Array<{ n: string; pct: number; reset?: number; clr: string }>; err?: string; active: boolean;
 }
 
-async function refreshUsage(index: number, account: StoredAccount): Promise<void> {
-	const usage = await fetchUsage(account);
-	if (!usage) return;
-
-	const updated: StoredAccount = {
-		...account,
-		usage: {
-			fetchedAt: Date.now(),
-			windows: usage.windows,
-		},
-		email: usage.email || account.email,
-	};
-
-	const store = loadStore();
-	store.accounts[index] = updated;
-	saveStore(store);
-}
-
-// =============================================================================
-// Smart Account Selection
-// =============================================================================
-
-async function selectAccount(
-	sessionKey: string,
-): Promise<{ account: StoredAccount; index: number } | null> {
-	const store = loadStore();
-	const accounts = store.accounts;
-	const now = Date.now();
-
-	const preferred: { account: StoredAccount; index: number; weekResetAt: number }[] = [];
-	const fallback: { account: StoredAccount; index: number; weekResetAt: number }[] = [];
-
-	for (let i = 0; i < accounts.length; i++) {
-		const acc = accounts[i];
-		if (!acc?.access) continue;
-
-		const refreshed = await refreshAccountIfNeeded(i);
-		if (!refreshed?.access) continue;
-		if (tokenNeedsRefresh(refreshed)) continue;
-
-		const usageAge = Date.now() - (refreshed.usage?.fetchedAt ?? 0);
-		if (usageAge >= USAGE_STALE_MS) {
-			await refreshUsage(i, refreshed);
-			const updated = loadStore().accounts[i];
-			if (updated) accounts[i] = updated;
-		}
-
-		const latest = accounts[i];
-		const weekResetAt = latest.usage?.windows["week"]?.resetAt ?? Infinity;
-		const weekPercent = latest.usage?.windows["week"]?.usedPercent ?? 0;
-		const depleted = (latest.depleted && latest.depleted.until > now) || weekPercent >= 100;
-		(depleted ? fallback : preferred).push({ account: latest, index: i, weekResetAt });
-	}
-
-	const candidates = preferred.length > 0 ? preferred : fallback;
-	if (candidates.length === 0) return null;
-
-	candidates.sort((a, b) => a.weekResetAt - b.weekResetAt);
-
-	let selected: { account: StoredAccount; index: number };
-	if (candidates.length > 1 && candidates[0].weekResetAt === candidates[1].weekResetAt) {
-		const tied = candidates.filter((c) => c.weekResetAt === candidates[0].weekResetAt);
-		selected = tied[hashIndex(sessionKey, tied.length)];
-	} else {
-		selected = candidates[0];
-	}
-
-	return { account: selected.account, index: selected.index };
-}
-
-// =============================================================================
-// OAuth Helpers
-// =============================================================================
-
-async function promptInput(ctx: UIContext, message: string): Promise<string> {
-	const value = await ctx.ui.input(message);
-	if (typeof value !== "string" || !value.trim()) throw new Error("Input cancelled");
-	return value.trim();
-}
-
-async function openBrowser(url: string): Promise<void> {
-	const platform = process.platform;
-	const command =
-		platform === "darwin"
-			? `open '${url.replace(/'/g, `'\\''`)}'`
-			: platform === "win32"
-				? `start "" "${url.replace(/"/g, '""')}"`
-				: `xdg-open '${url.replace(/'/g, `'\\''`)}'`;
-
-	await new Promise<void>((resolve) => {
-		exec(command, () => resolve());
-	});
-}
-
-async function addAccount(ctx: UIContext): Promise<StoredAccount> {
-	const credentials = await loginOpenAICodex({
-		onAuth: ({ url, instructions }) => {
-			void openBrowser(url);
-			ctx.ui.notify("Open this URL in your browser:", "info");
-			ctx.ui.notify(url, "info");
-			if (instructions) ctx.ui.notify(instructions, "info");
-		},
-		onPrompt: ({ message }) => promptInput(ctx, message),
-		onProgress: (message) => ctx.ui.notify(message, "info"),
-		originator: "pi",
-	});
-
-	let email: string | undefined;
-	try {
-		const res = await fetch("https://api.openai.com/v1/me", {
-			headers: { Authorization: `Bearer ${credentials.access}` },
-		});
-		if (res.ok) {
-			const data = (await res.json()) as any;
-			email = data?.email;
-		}
-	} catch {
-		// ignore
-	}
-
-	return {
-		access: credentials.access,
-		refresh: credentials.refresh,
-		expires: credentials.expires,
-		email,
-		addedAt: Date.now(),
-	};
-}
-
-// =============================================================================
-// Command Handler
-// =============================================================================
-
-async function handleCommand(args: string, ctx: UIContext): Promise<void> {
-	const parts = (args || "").trim().split(/\s+/).filter(Boolean);
-	const subcommand = parts[0]?.toLowerCase();
-	const subArgs = parts.slice(1);
-
-	switch (subcommand) {
-		case "add": {
-			let account: StoredAccount;
-			try {
-				account = await addAccount(ctx);
-			} catch (e) {
-				ctx.ui.notify(`Failed to add account: ${e}`, "error");
-				return;
-			}
-
-			const store = loadStore();
-			store.accounts.push(account);
-			saveStore(store);
-
-			const idx = store.accounts.length - 1;
-			ctx.ui.notify(
-				`OpenAI Codex account added at index ${idx}${account.email ? ` (${account.email})` : ""}`,
-				"success",
-			);
-
-			refreshUsage(idx, account).catch(() => {});
-			return;
-		}
-
-		case "list": {
-			const store = loadStore();
-			const now = Date.now();
-			const lines: string[] = [];
-			let hasAny = false;
-
-			for (let i = 0; i < store.accounts.length; i++) {
-				hasAny = true;
-				const acc = store.accounts[i];
-				const email = acc.email ?? "unknown";
-				const weekPercent = acc.usage?.windows["week"]?.usedPercent;
-
-				let status = "";
-				if (acc.depleted && acc.depleted.until > now) {
-					const remaining = Math.max(0, Math.ceil((acc.depleted.until - now) / 60000));
-					status = ` [depleted ${remaining}m]`;
-				} else if (acc.expires && acc.expires < now) {
-					status = " [expired]";
-				} else if (weekPercent !== undefined) {
-					status = ` ${weekPercent >= 100 ? "🔴" : weekPercent >= 80 ? "🟡" : "🟢"} ${weekPercent.toFixed(0)}%`;
-				}
-
-				lines.push(`[${i}] ${email}${status}`);
-			}
-
-			if (!hasAny) {
-				lines.push("(no accounts)");
-			}
-
-			ctx.ui.notify(lines.join("\n"), "info");
-			return;
-		}
-
-		case "remove": {
-			const rawIndex = subArgs[0];
-			const index = Number(rawIndex);
-
-			if (!Number.isInteger(index)) {
-				ctx.ui.notify("Usage: /multi-codex remove <index>", "error");
-				return;
-			}
-
-			const store = loadStore();
-			if (index < 0 || index >= store.accounts.length) {
-				ctx.ui.notify(`No account at index ${index}`, "error");
-				return;
-			}
-
-			const removed = store.accounts[index];
-			const ok = await ctx.ui.confirm(
-				"Remove OpenAI Codex account",
-				`Delete [${index}] ${removed.email ?? "unknown"}?`,
-			);
-			if (!ok) return;
-
-			store.accounts.splice(index, 1);
-			saveStore(store);
-
-			ctx.ui.notify(`Removed OpenAI Codex account [${index}]${removed.email ? ` (${removed.email})` : ""}`, "success");
-			return;
-		}
-
-		case "usage": {
-			await ctx.ui.custom((tui: any, theme: any, _kb: any, done: () => void) => {
-				return new UsageComponent(tui, theme, () => done(), ctx);
-			});
-			return;
-		}
-
-		case "":
-		case undefined: {
-			ctx.ui.notify(
-				`Usage: /multi-codex [add|list|remove|usage]\n` +
-				`  add              Add OpenAI Codex account\n` +
-				`  list             List accounts with usage\n` +
-				`  remove <index>   Remove account\n` +
-				`  usage            Show usage stats\n` +
-				`\nUsage is refreshed automatically.`,
-				"info",
-			);
-			return;
-		}
-
-		default: {
-			ctx.ui.notify(`Unknown command: ${subcommand}`, "error");
-			return;
-		}
-	}
-}
-
-function getArgumentCompletions(prefix: string): { value: string; label: string }[] | null {
-	const trimmed = prefix.trimStart();
-	const parts = trimmed.split(/\s+/).filter(Boolean);
-	const endsWithSpace = prefix.endsWith(" ");
-	const store = loadStore();
-
-	if (parts.length === 0) {
-		return [
-			{ value: "add", label: "add" },
-			{ value: "list", label: "list" },
-			{ value: "remove", label: "remove" },
-			{ value: "usage", label: "usage" },
-		];
-	}
-
-	if (parts.length === 1 && !endsWithSpace) {
-		const subcommands = ["add", "list", "remove", "usage"];
-		return subcommands.filter((s) => s.startsWith(parts[0])).map((s) => ({ value: s, label: s }));
-	}
-
-	if (parts[0] === "remove" && parts.length === 2 && !endsWithSpace) {
-		return store.accounts
-			.map((_, i) => String(i))
-			.filter((i) => i.startsWith(parts[1]))
-			.map((i) => ({ value: `remove ${i}`, label: i }));
-	}
-
-	return null;
-}
-
-// =============================================================================
-// Usage UI Component
-// =============================================================================
-
-class UsageComponent {
-	private usages: UsageSnapshot[] = [];
+class List {
+	private rs: Row[] = [];
 	private loading = true;
-	private tui: { requestRender: () => void };
-	private theme: any;
-	private onClose: () => void;
-	private ctx: UIContext;
+	private sel = 0;
+	private tu: { requestRender: () => void };
+	private th: any;
+	private done: () => void;
+	private ctx: any;
+	private busy = "";
 
-	constructor(tui: { requestRender: () => void }, theme: any, onClose: () => void, ctx: UIContext) {
-		this.tui = tui;
-		this.theme = theme;
-		this.onClose = onClose;
-		this.ctx = ctx;
-		this.load();
+	constructor(tu: any, th: any, done: () => void, ctx: any) {
+		this.tu = tu; this.th = th; this.done = done; this.ctx = ctx; void this.init();
 	}
 
-	private async load() {
-		const store = loadStore();
-		const snapshots: UsageSnapshot[] = [];
+	private d(s: string) { return this.th.fg("muted", s); }
+	private b(s: string) { return this.th.bold(s); }
+	private a(s: string) { return this.th.fg("accent", s); }
 
-		for (let i = 0; i < store.accounts.length; i++) {
-			const acc = store.accounts[i];
-			if (!acc?.access) continue;
+	private async init() {
+		const s = store.load();
+		const rs: Row[] = [];
+		for (const [k, st] of Object.entries(s).sort()) {
+			if (!k.startsWith(PF)) continue;
+			const i = parseInt(k.slice(PF.length), 10);
+			const ak = await this.ctx.modelRegistry.authStorage.getApiKey(k);
+			if (!ak) { delete s[k]; continue; }
 
-			const refreshed = await refreshAccountIfNeeded(i);
-			if (!refreshed) continue;
+			let w = st.usage?.w;
+			if (!st.usage || Date.now() - st.usage.at > STALE) {
+				const u = await usage(ak);
+				if (u) { w = u.w; s[k].usage = { at: Date.now(), w: u.w }; }
+			}
 
-			const usageData = await fetchUsage(refreshed);
-
-			snapshots.push({
-				index: i,
-				email: acc.email,
-				plan: usageData?.plan,
-				windows: usageData?.windows ?? acc.usage?.windows ?? {},
-				error: usageData === null ? "fetch failed" : undefined,
-			});
+			const wins: Row["win"] = [];
+			if (w) for (const [wn, wd] of Object.entries(w).sort((a, b) => ({ week: 0, primary: 1 } as any)[a[0]] - ({ week: 0, primary: 1 } as any)[b[0]])) {
+				const rem = 100 - wd.pct;
+				wins.push({ n: wn, pct: wd.pct, reset: wd.reset, clr: rem <= 10 ? "error" : rem <= 30 ? "warning" : "success" });
+			}
+			rs.push({ i, email: st.email ?? "unknown", win: wins, err: w ? undefined : "fetch failed", active: !!st.active });
 		}
-
-		this.usages = snapshots;
-		this.loading = false;
-		this.tui.requestRender();
+		store.save(s);
+		this.rs = rs;
+		const ai = rs.findIndex(r => r.active);
+		if (ai >= 0) this.sel = ai;
+		this.loading = false; this.tu.requestRender();
 	}
 
-	handleInput(data: string): void {
-		if (matchesKey(data, "escape")) {
-			this.onClose();
-		}
+	handleInput(ev: string): void {
+		if (this.busy) return;
+		if (matchesKey(ev, "escape")) { this.done(); return; }
+		if (matchesKey(ev, "up") || ev === "k") { this.sel = Math.max(0, this.sel - 1); this.tu.requestRender(); return; }
+		if (matchesKey(ev, "down") || ev === "j") { this.sel = Math.min(this.rs.length - 1, this.sel + 1); this.tu.requestRender(); return; }
+		if (matchesKey(ev, "enter")) { void this.withBusy("switch", () => this.doSwitch()); return; }
+		if (matchesKey(ev, "backspace") || matchesKey(ev, "delete")) { void this.withBusy("remove", () => this.doRemove()); }
+	}
+
+	private async withBusy(label: string, fn: () => Promise<void>) {
+		this.busy = label; this.tu.requestRender();
+		try { await fn(); }
+		catch { this.busy = ""; this.tu.requestRender(); }
+	}
+
+	private async doSwitch() {
+		const r = this.rs[this.sel]; if (!r) return;
+		const s = store.load();
+		for (const k of Object.keys(s)) if (k.startsWith(PF)) s[k].active = false;
+		s[pn(r.i)] = { ...s[pn(r.i)], active: true };
+		store.save(s);
+		const cred = this.ctx.modelRegistry.authStorage.get(pn(r.i));
+		if (cred) this.ctx.modelRegistry.authStorage.set(ACT, cred);
+		this.done();
+	}
+
+	private async doRemove() {
+		const r = this.rs[this.sel]; if (!r) return;
+		const s = store.load();
+		delete s[pn(r.i)];
+		if (r.active) this.ctx.modelRegistry.authStorage.remove(ACT);
+		this.ctx.modelRegistry.authStorage.remove(pn(r.i));
+		store.save(s);
+		this.busy = ""; this.loading = true; void this.init().then(() => { this.sel = Math.min(this.sel, this.rs.length - 1); this.tu.requestRender(); });
 	}
 
 	invalidate(): void {}
-
-	render(width: number): string[] {
-		const t = this.theme;
-		const dim = (s: string) => t.fg("muted", s);
-		const bold = (s: string) => t.bold(s);
-		const accent = (s: string) => t.fg("accent", s);
-
-		const totalW = width;
-		const innerW = totalW - 4;
-		const hLine = "─".repeat(totalW - 2);
-
-		const box = (content: string) => {
-			const contentW = this.visibleWidth(content);
-			const pad = Math.max(0, innerW - contentW);
-			return dim("│ ") + content + " ".repeat(pad) + dim(" │");
-		};
-
-		const lines: string[] = [];
-		lines.push(dim(`╭${hLine}╮`));
-		lines.push(box(bold(accent("multi-codex usage"))));
-		lines.push(dim(`├${hLine}┤`));
-
-		if (this.loading) {
-			lines.push(box("loading..."));
-		} else if (this.usages.length === 0) {
-			lines.push(box("no accounts configured"));
-			lines.push(box(""));
-			lines.push(box(dim("/multi-codex add")));
-		} else {
-			for (const u of this.usages) {
-				const email = u.email ?? "unknown";
-				const plan = u.plan ? dim(` (${u.plan})`) : "";
-				lines.push(box(`${bold(`[${u.index}]`)} ${email}${plan}`));
-
-				if (u.error) {
-					lines.push(box(dim(`  ${u.error}`)));
-					continue;
-				}
-
-				const sortedWindows = Object.entries(u.windows).sort((a, b) => {
-					const order = { week: 0, primary: 1 };
-					const oa = order[a[0] as keyof typeof order] ?? 99;
-					const ob = order[b[0] as keyof typeof order] ?? 99;
-					return oa - ob;
-				});
-
-				for (const [windowName, data] of sortedWindows) {
-					const used = Math.max(0, Math.min(100, data.usedPercent));
-					const remaining = Math.max(0, 100 - used);
-					const barW = 10;
-					const filled = Math.min(barW, Math.round((used / 100) * barW));
-					const empty = barW - filled;
-
-					const color = remaining <= 10 ? "error" : remaining <= 30 ? "warning" : "success";
-					const bar = t.fg(color, "█".repeat(filled)) + dim("░".repeat(empty));
-
-					const reset = data.resetAt ? dim(` ${this.formatReset(new Date(data.resetAt))}`) : "";
-					lines.push(box(`  ${windowName.padEnd(7)} ${bar} ${used.toFixed(0).padStart(3)}%${reset}`));
-				}
-
-				lines.push(box(""));
-			}
-		}
-
-		lines.push(dim(`├${hLine}┤`));
-		lines.push(box(dim("press esc to close")));
-		lines.push(dim(`╰${hLine}╯`));
-
-		return lines;
-	}
-
-	private visibleWidth(s: string): number {
-		return s.replace(/\x1b\[[0-9;]*m/g, "").length;
-	}
-
-	private formatReset(date: Date): string {
-		const diffMs = date.getTime() - Date.now();
-		if (diffMs < 0) return "now";
-		const diffMins = Math.floor(diffMs / 60000);
-		if (diffMins < 60) return `${diffMins}m`;
-		const hours = Math.floor(diffMins / 60);
-		const mins = diffMins % 60;
-		if (hours < 24) return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
-		const days = Math.floor(hours / 24);
-		return `${days}d`;
-	}
-
 	dispose(): void {}
-}
 
-// =============================================================================
-// Streaming with Smart Routing
-// =============================================================================
+	render(w: number): string[] {
+		const t = this.th, iw = w - 4, hl = "─".repeat(w - 2);
+		const bx = (c: string) => this.d("│ ") + c + " ".repeat(Math.max(0, iw - c.replace(/\x1b\[[0-9;]*m/g, "").length)) + this.d(" │");
+		const l: string[] = [];
 
-function streamMultiProvider(
-	model: Model<Api>,
-	context: Context,
-	options?: SimpleStreamOptions,
-): AssistantMessageEventStream {
-	const stream = createAssistantMessageEventStream();
-
-	(async () => {
-		const selected = await selectAccount(currentSessionKey);
-		if (!selected) {
-			stream.push({
-				type: "error",
-				reason: "error",
-				error: {
-					role: "assistant",
-					content: [],
-					api: model.api,
-					provider: model.provider,
-					model: model.id,
-					usage: {
-						input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
-						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-					},
-					stopReason: "error",
-					errorMessage: "No usable OpenAI Codex accounts",
-					timestamp: Date.now(),
-				},
-			});
-			stream.end();
-			return;
+		if (this.busy) {
+			const act = this.busy === "switch" ? "switching" : "removing";
+			l.push(this.d(`╭${hl}╮`), bx(this.b(this.a("multi-codex"))), this.d(`├${hl}┤`));
+			l.push(bx(`${act} [${this.rs[this.sel]?.i}] ${this.rs[this.sel]?.email}...`));
+			l.push(this.d(`╰${hl}╯`)); return l;
 		}
 
-		const { account, index } = selected;
-		const apiKey = account.access;
-		const inner = streamSimple(
-			{
-				...model,
-				api: "openai-codex-responses" as Api,
-				provider: PROVIDER_CONFIG.provider,
-			} as any,
-			context,
-			{ ...options, apiKey },
-		);
+		l.push(this.d(`╭${hl}╮`), bx(this.b(this.a("multi-codex"))), this.d(`├${hl}┤`));
 
-		const buffered: any[] = [];
-		let committed = false;
-
-		for await (const rawEvent of inner as any) {
-			const event = remapEvent(rawEvent, model);
-			if (!committed) {
-				if (event.type === "start") {
-					buffered.push(event);
-					continue;
-				}
-				if (event.type === "error") {
-					const errorMsg = event.error?.errorMessage ?? "";
-					const reason = parseRateLimitReason(errorMsg);
-					if (reason !== "UNKNOWN" || /429|rate.?limit/i.test(errorMsg)) {
-						const hasPrimary = "primary" in (account.usage?.windows ?? {});
-						const windowKey =
-							reason === "QUOTA_EXHAUSTED" || !hasPrimary ? "week" : "primary";
-
-						// Try to extract resets_at from the error JSON payload first
-						let until: number | undefined;
-						try {
-							const jsonMatch = errorMsg.match(/\{.*\}/s);
-							if (jsonMatch) {
-								const parsed = JSON.parse(jsonMatch[0]);
-								const resetsAt = parsed?.error?.resets_at ?? parsed?.resets_at;
-								if (resetsAt) until = resetsAt * 1000;
-							}
-						} catch { /* ignore */ }
-
-						if (!until || until <= Date.now()) {
-							until = account.usage?.windows[windowKey]?.resetAt;
-						}
-						if (!until || until <= Date.now()) {
-							until = Date.now() + calculateRateLimitBackoffMs(reason);
-						}
-
-						markDepleted(index, { window: windowKey, until, reason });
-					}
-					stream.push(event);
-					stream.end();
-					return;
-				}
-				committed = true;
-				for (const pending of buffered) stream.push(pending);
+		if (this.loading) l.push(bx("loading..."));
+		else if (!this.rs.length) { l.push(bx("no accounts"), bx(""), bx(this.d("/multi-codex add"))); }
+		else for (let i = 0; i < this.rs.length; i++) {
+			const r = this.rs[i];
+			l.push(bx(`${i === this.sel ? t.fg("accent", "▸ ") : "  "}${this.b(`[${r.i}]`)} ${r.email}${r.active ? t.fg("success", " ●") : ""}`));
+			if (r.err) { l.push(bx(this.d(`   ${r.err}`))); continue; }
+			for (const w of r.win) {
+				const f = Math.min(10, Math.round(w.pct / 10)), e = 10 - f;
+				const bar = t.fg(w.clr, "█".repeat(f)) + this.d("░".repeat(e));
+				const rs = w.reset ? this.d(` ${fmt(new Date(w.reset))}`) : "";
+				l.push(bx(`   ${w.n.padEnd(8)} ${bar} ${w.pct.toFixed(0).padStart(3)}%${rs}`));
 			}
-			stream.push(event);
 		}
 
-		stream.end();
-	})();
-
-	return stream;
+		l.push(this.d(`├${hl}┤`), bx(this.d("↑↓ select  ↵ switch  ⌫ remove  esc close")), this.d(`╰${hl}╯`));
+		return l;
+	}
 }
 
-function remapEvent(event: any, model: Model<Api>) {
-	if (!event || typeof event !== "object") return event;
-	const remapped = { ...event };
-	if ("partial" in remapped && remapped.partial?.role === "assistant") {
-		remapped.partial = { ...remapped.partial, api: model.api, provider: model.provider, model: model.id };
-	}
-	if ("message" in remapped && remapped.message?.role === "assistant") {
-		remapped.message = { ...remapped.message, api: model.api, provider: model.provider, model: model.id };
-	}
-	if ("error" in remapped && remapped.error?.role === "assistant") {
-		remapped.error = { ...remapped.error, api: model.api, provider: model.provider, model: model.id };
-	}
-	return remapped;
+function fmt(d: Date): string {
+	const df = d.getTime() - Date.now(); if (df < 0) return "now";
+	const m = Math.floor(df / 60000); if (m < 60) return `in ${m}m`;
+	const h = Math.floor(m / 60); if (h < 24) return `in ${h}h${m % 60 ? ` ${m % 60}m` : ""}`;
+	return `in ${Math.floor(h / 24)}d`;
 }
 
-// =============================================================================
-// Extension Entry Point
-// =============================================================================
+// ---------------------------------------------------------------------------
+// Entry
+// ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
-	pi.on("session_start", async (_event, ctx) => {
-		currentSessionKey = getSessionKey(ctx as UIContext);
-		const store = loadStore();
-		for (let i = 0; i < store.accounts.length; i++) {
-			const acc = store.accounts[i];
-			if (!acc?.access) continue;
-			refreshUsage(i, acc).catch(() => {});
-		}
-	});
-
-	pi.on("before_agent_start", async (_event, ctx) => {
-		currentSessionKey = getSessionKey(ctx as UIContext);
-	});
-
-	pi.on("before_provider_request", async (_event, ctx) => {
-		currentSessionKey = getSessionKey(ctx as UIContext);
-	});
-
-	pi.registerProvider(PROVIDER_CONFIG.provider, {
-		baseUrl: PROVIDER_CONFIG.baseUrl,
-		apiKey: "__multi_account_internal__",
-		api: PROVIDER_CONFIG.api,
-		models: PROVIDER_CONFIG.models.map((model) => ({
-			...model,
-			input: [...model.input],
-			cost: {
-				input: model.cost.input,
-				output: model.cost.output,
-				cacheRead: model.cost.cacheRead,
-				cacheWrite: model.cost.cacheWrite,
-			},
-		})),
-		streamSimple: streamMultiProvider as any,
-	});
-
 	pi.registerCommand("multi-codex", {
-		description: "Manage multi-account OpenAI Codex providers",
-		getArgumentCompletions,
-		handler: async (args, ctx) => handleCommand(args, ctx as UIContext),
+		description: "Manage multiple OpenAI Codex accounts",
+		getArgumentCompletions(pref: string) {
+			const p = pref.trimStart().split(/\s+/).filter(Boolean);
+			if (!p.length) return [{ value: "list", label: "list" }, { value: "add", label: "add" }];
+			if (p.length === 1 && !pref.endsWith(" "))
+				return ["list", "add"].filter(s => s.startsWith(p[0])).map(s => ({ value: s, label: s }));
+			return null;
+		},
+		handler: async (args, ctx) => {
+			const p = (args || "").trim().split(/\s+/).filter(Boolean);
+			const sub = p[0]?.toLowerCase();
+
+			if (sub === "add") {
+				try {
+					const creds = await loginOpenAICodex({
+						onAuth: ({ url, instructions }) => {
+							ctx.ui.notify(`Open: ${url}`, "info");
+							if (instructions) ctx.ui.notify(instructions, "info");
+							void import("node:child_process").then(({ exec }) => {
+								exec(process.platform === "darwin" ? `open '${url}'` : process.platform === "win32" ? `start "" "${url}"` : `xdg-open '${url}'`);
+							});
+						},
+						onPrompt: async ({ message }) => {
+							const v = await ctx.ui.input(message);
+							if (!v?.trim()) throw new Error("Cancelled");
+							return v.trim();
+						},
+						onProgress: (msg: string) => ctx.ui.notify(msg, "info"),
+						originator: "pi",
+					});
+
+					let idx = 0;
+					for (const k of ctx.modelRegistry.authStorage.list()) {
+						if (k.startsWith(PF)) { const n = parseInt(k.slice(PF.length), 10); if (!isNaN(n) && n >= idx) idx = n + 1; }
+					}
+
+					ctx.modelRegistry.authStorage.set(pn(idx), { type: "oauth", ...creds });
+					const em = await profile(creds.access);
+					const s = store.load();
+					for (const k of Object.keys(s)) if (k.startsWith(PF)) s[k].active = false;
+					s[pn(idx)] = { email: em, active: true };
+					store.save(s);
+
+					ctx.modelRegistry.authStorage.set(ACT, { type: "oauth", ...creds });
+					ctx.ui.notify(`Added & switched to [${idx}]${em ? ` (${em})` : ""}`, "success");
+				} catch (e: any) { ctx.ui.notify(`Failed: ${e?.message || e}`, "error"); }
+				return;
+			}
+
+			if (sub === "list" || !sub) {
+				await ctx.ui.custom((tu: any, th: any, _kb: any, done: () => void) => new List(tu, th, done, ctx));
+				return;
+			}
+
+			ctx.ui.notify("/multi-codex add    Add account\n/multi-codex list   List (↑↓ ↵ switch, ⌫ remove)", "info");
+		},
 	});
 }
