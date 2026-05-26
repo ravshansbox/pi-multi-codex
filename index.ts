@@ -1,11 +1,3 @@
-/**
- * Multi-Codex Extension
- *
- * Stores multiple OpenAI Codex OAuth tokens in auth.json as "openai-codex-N".
- * No state file, no cached metadata — everything fetched live.
- * Active account = whichever token is under the "openai-codex" key.
- */
-
 import { loginOpenAICodex } from "@earendil-works/pi-ai/oauth";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
@@ -53,10 +45,6 @@ async function fetchProfile(ak: string) {
 
 function pn(n: number) { return `${PF}${n}`; }
 
-// ---------------------------------------------------------------------------
-// Auth helpers — everything in auth.json
-// ---------------------------------------------------------------------------
-
 function getAccounts(as: any): string[] {
 	return (as.list?.() ?? []).filter((k: string) => k.startsWith(PF)).sort();
 }
@@ -70,10 +58,6 @@ function getActive(as: any): string | undefined {
 	}
 	return undefined;
 }
-
-// ---------------------------------------------------------------------------
-// TUI list
-// ---------------------------------------------------------------------------
 
 interface Row {
 	key: string; i: number; email: string; plan?: string; win: Array<{ n: string; pct: number; reset?: number; clr: string }>; err?: string; active: boolean;
@@ -108,7 +92,10 @@ class List {
 			const v = as.get(k);
 			if (!v) continue;
 
-			const [u, p] = await Promise.all([fetchUsage(v.access), fetchProfile(v.access)]);
+			const ak = (Date.now() >= (v as any).expires) ? await as.getApiKey(k).catch(() => undefined) : (v as any).access;
+			if (!ak) { rs.push({ key: k, i, email: "unknown", win: [], err: "auth expired", active: k === activeKey }); continue; }
+
+			const [u, p] = await Promise.all([fetchUsage(ak), fetchProfile(ak)]);
 			const wins: Row["win"] = [];
 			if (u?.w) for (const [wn, wd] of Object.entries(u.w).sort((a, b) => ({ week: 0, primary: 1 } as any)[a[0]] - ({ week: 0, primary: 1 } as any)[b[0]])) {
 				const rem = 100 - wd.pct;
@@ -232,11 +219,79 @@ function fmt(d: Date): string {
 	return `in ${Math.floor(h / 24)}d`;
 }
 
-// ---------------------------------------------------------------------------
-// Entry
-// ---------------------------------------------------------------------------
-
 export default function (pi: ExtensionAPI) {
+	pi.on("session_start", async (_event, ctx) => {
+		const as = ctx.modelRegistry.authStorage;
+		for (const k of as.list?.() ?? []) {
+			if (k.startsWith(PF) || k === ACT) {
+				try { await as.getApiKey(k); } catch {}
+			}
+		}
+	});
+
+	pi.on("message_end", async (event, ctx) => {
+		if (event.message.role !== "assistant") return;
+		const msg = event.message as any;
+		if (msg.stopReason !== "error") return;
+		const em = msg.errorMessage ?? "";
+		if (!/usage.limit/i.test(em)) return;
+
+		const as = ctx.modelRegistry.authStorage;
+		const accounts = getAccounts(as);
+		if (accounts.length <= 1) return;
+
+		const activeKey = getActive(as);
+		// Score accounts: prefer capacity-first, then soonest reset as tiebreaker
+		const scored: Array<{ key: string; pct: number; reset: number; cred: any }> = [];
+		for (const k of accounts) {
+			const v = as.get(k);
+			if (!v) continue;
+			const ak = (Date.now() >= (v as any).expires) ? await as.getApiKey(k).catch(() => undefined) : (v as any).access;
+			if (!ak) continue;
+			const u = await fetchUsage(ak);
+			if (!u?.w) continue;
+			// Use the most-limiting window's percentage
+			const now = Date.now();
+			const pp = (u.w["primary"]?.reset && u.w["primary"].reset! <= now) ? 0 : (u.w["primary"]?.pct ?? 0);
+			const wp = (u.w["week"]?.reset && u.w["week"].reset! <= now) ? 0 : (u.w["week"]?.pct ?? 0);
+			const pct = Math.max(pp, wp);
+			const rp = u.w["primary"]?.reset ?? Infinity;
+			const rw = u.w["week"]?.reset ?? Infinity;
+			const reset = Math.min(rp, rw);
+			scored.push({ key: k, pct, reset, cred: v });
+		}
+		if (scored.length === 0) return;
+
+		// Sort: accounts with capacity first (pct < 100), then by soonest reset
+		scored.sort((a, b) => {
+			const aHas = a.pct < 100 ? 0 : 1;
+			const bHas = b.pct < 100 ? 0 : 1;
+			if (aHas !== bHas) return aHas - bHas;
+			return a.reset - b.reset;
+		});
+
+		const best = scored.find(s => s.key !== activeKey) ?? scored[0];
+
+		// Don't switch to an account that's also fully rate-limited
+		if (best.pct >= 100) {
+			ctx.ui.notify("All accounts rate-limited — wait for reset", "error");
+			return;
+		}
+
+		as.set(ACT, best.cred);
+		const r = new Date(best.reset);
+		ctx.ui.notify(`Switched to [${best.key.slice(PF.length)}] (resets ${r.getHours()}:${String(r.getMinutes()).padStart(2, "0")})`, "warning");
+
+		const entries = ctx.sessionManager.getEntries();
+		for (let i = entries.length - 1; i >= 0; i--) {
+			const e = entries[i];
+			if (e.type === "message" && e.role === "user") {
+				pi.sendUserMessage(e.content, { deliverAs: "followUp" });
+				break;
+			}
+		}
+	});
+
 	pi.registerCommand("multi-codex", {
 		description: "Manage multiple OpenAI Codex accounts",
 		handler: async (_args, ctx) => {
