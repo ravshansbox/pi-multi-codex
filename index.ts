@@ -321,6 +321,7 @@ class AccountList implements Component {
 			});
 		}
 
+		rows.sort(compareRowsByWeeklyReset);
 		this.rows = rows;
 
 		const activeIndex = rows.findIndex((row) => row.active);
@@ -443,7 +444,7 @@ class AccountList implements Component {
 			authStorage.set(makeAccountKey(nextIndex), credential);
 			authStorage.set(ACTIVE_KEY, credential);
 
-			this.context.ui.notify(`Added & switched to [${nextIndex}]`, "info");
+			this.context.ui.notify("Added & switched account", "info");
 		} catch (error) {
 			this.context.ui.notify(
 				`Failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -519,11 +520,7 @@ class AccountList implements Component {
 				const planLabel = row.plan ? theme.fg("accent", ` ${row.plan}`) : "";
 				const cursor = isSelected ? theme.fg("accent", "▸ ") : "  ";
 				const activeDot = row.active ? theme.fg("success", " ●") : "";
-				lines.push(
-					boxLine(
-						`${cursor}${this.bold(`[${row.index}]`)} ${row.email}${planLabel}${activeDot}`,
-					),
-				);
+				lines.push(boxLine(`${cursor}${this.bold(row.email)}${planLabel}${activeDot}`));
 
 				if (row.error) {
 					lines.push(boxLine(this.dim(`   ${row.error}`)));
@@ -555,6 +552,16 @@ class AccountList implements Component {
 
 		return lines;
 	}
+}
+
+function getWeeklyReset(row: AccountRow): number {
+	return row.usageWindows.find((window) => window.name === "week")?.reset ?? Number.POSITIVE_INFINITY;
+}
+
+function compareRowsByWeeklyReset(first: AccountRow, second: AccountRow): number {
+	const resetDiff = getWeeklyReset(first) - getWeeklyReset(second);
+	if (resetDiff !== 0) return resetDiff;
+	return first.email.localeCompare(second.email);
 }
 
 function formatCountdown(date: Date): string {
@@ -661,7 +668,7 @@ export default function (pi: ExtensionAPI) {
 
 		const resetDate = new Date(best.reset);
 		context.ui.notify(
-			`Switched to [${best.key.slice(ACCOUNT_PREFIX.length)}] ` +
+			`Switched account ` +
 				`(resets ${resetDate.getHours()}:` +
 				`${String(resetDate.getMinutes()).padStart(2, "0")})`,
 			"warning",
