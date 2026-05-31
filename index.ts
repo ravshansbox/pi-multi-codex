@@ -48,7 +48,6 @@ async function fetchUsage(apiKey: string): Promise<UsageResult | "unauthorized" 
 
 		if (!response.ok) {
 			debug("fetchUsage non-ok", response.status);
-			// Signal auth failures distinctly so the caller can try a refresh.
 			if (response.status === 401 || response.status === 403) return "unauthorized";
 			return null;
 		}
@@ -153,9 +152,13 @@ function getStoredToken(authStorage: AuthStorage, key: string): string | undefin
 }
 
 /**
- * Refresh an expired account via the registered provider id, persisting the
- * refreshed credential back to the account's own storage key. Only used as a
- * fallback when the stored token is actually rejected by the API.
+ * Refresh an expired numbered account via the registered provider id, persisting
+ * the refreshed credential back to the account's own storage key.
+ *
+ * Do not refresh ACTIVE_KEY as a separate account. ACTIVE_KEY is only used as the
+ * provider refresh channel because pi registers the OAuth provider under that id.
+ * If the refreshed numbered account is the active one, copy the refreshed
+ * credential to ACTIVE_KEY exactly once.
  */
 async function refreshAccount(authStorage: AuthStorage, key: string): Promise<string | undefined> {
 	const original = authStorage.get(key);
@@ -166,7 +169,7 @@ async function refreshAccount(authStorage: AuthStorage, key: string): Promise<st
 
 	try {
 		// getApiKey only knows the provider registered under ACTIVE_KEY, so route
-		// the refresh through it, then copy the refreshed credential back.
+		// numbered-account refreshes through it, then persist the refreshed value.
 		authStorage.set(ACTIVE_KEY, original);
 		const token = await authStorage.getApiKey(ACTIVE_KEY).catch((error: unknown) => {
 			debug("refresh error", key, error);
@@ -176,8 +179,13 @@ async function refreshAccount(authStorage: AuthStorage, key: string): Promise<st
 		if (refreshed) authStorage.set(key, refreshed);
 		return token ?? undefined;
 	} finally {
-		if (previousActive && !wasActive) {
+		const refreshed = authStorage.get(key);
+		if (wasActive && refreshed) {
+			authStorage.set(ACTIVE_KEY, refreshed);
+		} else if (previousActive) {
 			authStorage.set(ACTIVE_KEY, previousActive);
+		} else {
+			authStorage.remove(ACTIVE_KEY);
 		}
 	}
 }
@@ -260,8 +268,6 @@ class AccountList implements Component {
 				continue;
 			}
 
-			// Try the stored token first — it's almost always valid right after
-			// login. Only fall back to a refresh if the API actually rejects it.
 			let apiKey = getStoredToken(authStorage, accountKey);
 			let usage = apiKey ? await fetchUsage(apiKey) : "unauthorized";
 
@@ -375,9 +381,7 @@ class AccountList implements Component {
 		if (!row || row.active) return;
 
 		const authStorage = this.context.modelRegistry.authStorage;
-		// Copy this account's stored credential into the active provider key.
-		// The token is valid as-is; if it ever needs refreshing, the registered
-		// provider (ACTIVE_KEY) will handle that on the next request.
+		// Copy this account's stored credential into the active provider key without refreshing ACTIVE_KEY.
 		const credential = authStorage.get(row.key);
 		if (credential) {
 			authStorage.set(ACTIVE_KEY, credential);
@@ -570,18 +574,6 @@ function formatCountdown(date: Date): string {
 }
 
 export default function (pi: ExtensionAPI) {
-	pi.on("session_start", async (_event, context) => {
-		// Only the active provider key ("openai-codex") is a registered OAuth
-		// provider, so it's the only one getApiKey can refresh. Numbered account
-		// keys keep their stored tokens and are refreshed lazily on demand.
-		const authStorage = context.modelRegistry.authStorage;
-		try {
-			await authStorage.getApiKey(ACTIVE_KEY);
-		} catch (error) {
-			debug("session_start refresh failed", error);
-		}
-	});
-
 	pi.on("message_end", async (event, context) => {
 		const message = event.message;
 		if (message.role !== "assistant") return;
