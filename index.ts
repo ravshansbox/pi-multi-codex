@@ -1,476 +1,812 @@
+//  pi-multi-codex — manage multiple OpenAI Codex accounts in pi
+//
+//  This extension lets you register, switch between, and remove multiple
+//  OpenAI Codex (ChatGPT) accounts.  It provides:
+//
+//    • A TUI account list with usage bars, rate-limit windows, and active status
+//    • Auto-switch on rate-limit errors (retries your last message on the next
+//      available account)
+//    • OAuth-based account addition with browser launch and progress indicators
+//
+//  Accounts are stored under numbered keys:  openai-codex-0, openai-codex-1, …
+//  A separate pointer (openai-codex-active) records which slot is active.
+//  This decouples "which account is active" from the legacy credential blob,
+//  making switches a simple pointer update.
+//
+//  On rate-limit errors, every account is scored in parallel:
+//    1. Accounts with capacity (< 100 %) rank above exhausted ones
+//    2. Within each tier, the earliest reset time wins
+//  The best available account — ideally different from the current one — is
+//  activated and your last user message is re-sent.
+
 import { loginOpenAICodex } from "@earendil-works/pi-ai/oauth";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
 
-const ACCOUNT_PREFIX = "openai-codex-";
-const ACTIVE_KEY = "openai-codex";
-/** Separate pointer that records WHICH numbered account is currently active. */
-const ACTIVE_POINTER_KEY = "openai-codex-active";
-const FETCH_TIMEOUT_MS = 10000;
+// ── Storage keys ───────────────────────────────────────────────────────────
+
+const ACCOUNT_PREFIX = "openai-codex-";            // per-account slot, e.g. openai-codex-3
+const ACTIVE_KEY = "openai-codex";                  // legacy credential blob
+const ACTIVE_POINTER_KEY = "openai-codex-active";   // points to the active slot
+
+const FETCH_TIMEOUT_MS = 10_000;
+
+// ── Debug ───────────────────────────────────────────────────────────────────
 
 const DEBUG = !!process.env.MULTI_CODEX_DEBUG;
-function debug(...args: unknown[]) {
-	if (DEBUG) console.error("[multi-codex]", ...args);
+
+function debug(...args: unknown[]): void {
+  if (DEBUG) console.error("[multi-codex]", ...args);
 }
 
+// ── Usage metadata ──────────────────────────────────────────────────────────
+
+// A single rate-limit window — either the short "primary" limit (~per-minute)
+// or the rolling "week" limit.
 interface UsageWindow {
-	pct: number;
-	reset?: number;
+  pct: number;        // percentage used (0–100+)
+  reset?: number;     // epoch ms when this window resets, if known
 }
 
+// Parsed response from the ChatGPT usage endpoint.
 interface UsageResult {
-	windows: Record<string, UsageWindow>;
-	plan?: string;
-	email?: string;
+  windows: Record<string, UsageWindow>;   // "primary" | "week"
+  plan?: string;                           // plan tier above "free" (e.g. "plus")
+  email?: string;                          // from the API response
 }
 
+// Hit the ChatGPT usage endpoint.  Returns null on any failure.
 async function fetchUsage(apiKey: string): Promise<UsageResult | null> {
-	try {
-		const res = await fetch("https://chatgpt.com/backend-api/wham/usage", {
-			headers: { Authorization: `Bearer ${apiKey}`, "User-Agent": "pi-agent", Accept: "application/json" },
-			signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-		});
-		if (!res.ok) {
-			debug("fetchUsage non-ok", res.status);
-			return null;
-		}
-		const data = (await res.json()) as any;
-		const windows: Record<string, UsageWindow> = {};
-		// The API returns named windows; label each by its actual duration rather than
-		// array position. Windows < ~1 day are the short ("primary") limit; longer ones
-		// are the rolling weekly ("week") limit. Either may be null/absent.
-		const DAY_SECONDS = 86400;
-		for (const raw of [data.rate_limit?.primary_window, data.rate_limit?.secondary_window]) {
-			if (!raw) continue;
-			const durationSeconds = raw.limit_window_seconds ?? 0;
-			const name = durationSeconds > 0 && durationSeconds < DAY_SECONDS ? "primary" : "week";
-			windows[name] = { pct: raw.used_percent || 0, reset: raw.reset_at ? raw.reset_at * 1000 : undefined };
-		}
-		let plan: string | undefined;
-		if (data.plan_type && data.plan_type !== "free") plan = data.plan_type;
-		const email = typeof data.email === "string" ? data.email : undefined;
-		return { windows, plan, email };
-	} catch (err) {
-		debug("fetchUsage error", err);
-		return null;
-	}
+  try {
+    const res = await fetch("https://chatgpt.com/backend-api/wham/usage", {
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "User-Agent": "pi-agent",
+        Accept: "application/json",
+      },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+    if (!res.ok) {
+      debug("fetchUsage non-ok", res.status);
+      return null;
+    }
+
+    const data = (await res.json()) as any;
+    const windows: Record<string, UsageWindow> = {};
+
+    // The API returns two windows.  We label them by duration:
+    //   • < 1 day → "primary" (per-minute-ish limit)
+    //   • ≥ 1 day → "week"   (rolling weekly limit)
+    const ONE_DAY_SECONDS = 86_400;
+
+    for (const raw of [
+      data.rate_limit?.primary_window,
+      data.rate_limit?.secondary_window,
+    ]) {
+      if (!raw) continue;
+      const durationSeconds: number = raw.limit_window_seconds ?? 0;
+      const label =
+        durationSeconds > 0 && durationSeconds < ONE_DAY_SECONDS
+          ? "primary"
+          : "week";
+      windows[label] = {
+        pct: raw.used_percent || 0,
+        reset: raw.reset_at
+          ? raw.reset_at * 1000   // unix seconds → epoch ms
+          : undefined,
+      };
+    }
+
+    let plan: string | undefined;
+    if (data.plan_type && data.plan_type !== "free") plan = data.plan_type;
+
+    const email =
+      typeof data.email === "string" ? data.email : undefined;
+
+    return { windows, plan, email };
+  } catch (err) {
+    debug("fetchUsage error", err);
+    return null;
+  }
 }
 
+// Extract email from the JWT payload claim `https://api.openai.com/profile.email`.
+// Returns undefined if the token is malformed or the claim is absent.
 function parseEmailFromJwt(apiKey: string): string | undefined {
-	try {
-		const payload = apiKey.split(".")[1];
-		if (!payload) return undefined;
-		const decoded = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
-		return decoded?.["https://api.openai.com/profile"]?.email as string | undefined;
-	} catch (err) {
-		debug("parseEmailFromJwt error", err);
-		return undefined;
-	}
+  try {
+    const [, payloadB64] = apiKey.split(".");
+    if (!payloadB64) return undefined;
+    const decoded = JSON.parse(
+      Buffer.from(payloadB64, "base64url").toString("utf8"),
+    );
+    return decoded?.["https://api.openai.com/profile"]
+      ?.email as string | undefined;
+  } catch (err) {
+    debug("parseEmailFromJwt error", err);
+    return undefined;
+  }
 }
 
-function accountKey(index: number): string {
-	return `${ACCOUNT_PREFIX}${index}`;
+// ── Account storage helpers ─────────────────────────────────────────────────
+
+function accountKey(slotIndex: number): string {
+  return `${ACCOUNT_PREFIX}${slotIndex}`;
 }
 
+// List all registered account keys, sorted numerically.
 function getAccounts(authStorage: any): string[] {
-	return ((authStorage.list?.() ?? []) as string[]).filter((k) => k.startsWith(ACCOUNT_PREFIX) && k !== ACTIVE_POINTER_KEY).sort();
+  return ((authStorage.list?.() ?? []) as string[])
+    .filter(
+      (k) => k.startsWith(ACCOUNT_PREFIX) && k !== ACTIVE_POINTER_KEY,
+    )
+    .sort();
 }
 
-/** True when a credential has no valid (future) expiry and must be refreshed. */
+// True when the credential has already expired (or has no expiry field at all).
 function isExpired(cred: any): boolean {
-	const expires = cred?.expires;
-	if (typeof expires !== "number") return true;
-	return Date.now() >= expires;
+  const expires: unknown = cred?.expires;
+  if (typeof expires !== "number") return true;
+  return Date.now() >= expires;
 }
 
-/**
- * Resolve a usable API key for an account, refreshing via getApiKey when the
- * stored token is missing or expired.
- */
-async function resolveApiKey(authStorage: any, key: string, cred: any): Promise<string | undefined> {
-	if (cred && !isExpired(cred) && typeof cred.access === "string") return cred.access;
-	return authStorage.getApiKey(key).catch((err: unknown) => {
-		debug("resolveApiKey error", key, err);
-		return undefined;
-	});
+// Get a usable API key for an account.  Returns the stored access token if
+// it is still valid; otherwise refreshes via getApiKey.
+async function resolveApiKey(
+  authStorage: any,
+  key: string,
+  cred: any,
+): Promise<string | undefined> {
+  if (cred && !isExpired(cred) && typeof cred.access === "string") {
+    return cred.access;
+  }
+  return authStorage.getApiKey(key).catch((err: unknown) => {
+    debug("resolveApiKey error", key, err);
+    return undefined;
+  });
 }
 
-/**
- * Determine the active account key. Prefers the explicit pointer; falls back to
- * value-comparison against the legacy active credential for backward compat.
- */
+// Determine which account is currently active.
+//
+//  1. Read the explicit pointer (openai-codex-active).  If it references a
+//     known account key, return that key.
+//  2. Fall back to the legacy blob (openai-codex): find which numbered
+//     account matches it by value.  This handles single-account upgrades.
 function getActive(authStorage: any): string | undefined {
-	const pointer = authStorage.get(ACTIVE_POINTER_KEY) as any;
-	const pointerKey = pointer?.type === "api_key" ? pointer.key : undefined;
-	if (typeof pointerKey === "string" && authStorage.get(pointerKey)) return pointerKey;
+  // explicit pointer
+  const pointer = authStorage.get(ACTIVE_POINTER_KEY) as any;
+  const pointerKey: unknown =
+    pointer?.type === "api_key" ? pointer.key : undefined;
+  if (typeof pointerKey === "string" && authStorage.get(pointerKey)) {
+    return pointerKey;
+  }
 
-	const active = authStorage.get(ACTIVE_KEY);
-	if (!active) return undefined;
-	for (const key of getAccounts(authStorage)) {
-		const v = authStorage.get(key);
-		if (v && v.type === active.type && v.access === active.access) return key;
-	}
-	return undefined;
+  // legacy blob fallback
+  const legacyActive = authStorage.get(ACTIVE_KEY);
+  if (!legacyActive) return undefined;
+  for (const key of getAccounts(authStorage)) {
+    const stored = authStorage.get(key);
+    if (
+      stored &&
+      stored.type === legacyActive.type &&
+      stored.access === legacyActive.access
+    ) {
+      return key;
+    }
+  }
+  return undefined;
 }
 
-/** Mark an account as active: copy its credential to ACTIVE_KEY and record the pointer. */
+// Mark a slot as active — copies its credential to the legacy blob and
+// records the pointer.
 function setActive(authStorage: any, key: string, cred: any): void {
-	authStorage.set(ACTIVE_KEY, cred);
-	authStorage.set(ACTIVE_POINTER_KEY, { type: "api_key", key });
+  authStorage.set(ACTIVE_KEY, cred);
+  authStorage.set(ACTIVE_POINTER_KEY, { type: "api_key", key });
 }
 
+// ── TUI account list ───────────────────────────────────────────────────────
+
+// One row in the picker TUI.
 interface Row {
-	key: string;
-	index: number;
-	email: string;
-	plan?: string;
-	windows: Array<{ name: string; pct: number; reset?: number; color: string }>;
-	error?: string;
-	active: boolean;
+  key: string;      // storage key, e.g. openai-codex-2
+  index: number;    // numeric slot
+  email: string;    // from JWT or usage API
+  plan?: string;    // plan tier above free
+  windows: Array<{
+    name: string;   // "primary" | "week"
+    pct: number;
+    reset?: number;
+    color: string;  // "success" | "warning" | "error"
+  }>;
+  error?: string;   // human-readable, if usage fetch failed
+  active: boolean;
 }
 
+//
+// Interactive TUI for viewing / managing accounts.
+//
+// Keys:
+//   ↑↓ / jk — navigate
+//   Enter   — switch to selected account
+//   a       — add account (OAuth)
+//   ⌫ Del   — remove selected account
+//   Esc     — close
+//
 class List {
-	private rows: Row[] = [];
-	private loading = true;
-	private selected = 0;
-	private tui: { requestRender: () => void };
-	private theme: any;
-	private done: (result?: unknown) => void;
-	private ctx: any;
-	private busy = "";
+  private rows: Row[] = [];
+  private loading = true;
+  private selected = 0;
+  private tui: { requestRender: () => void };
+  private theme: any;
+  private done: (result?: unknown) => void;
+  private ctx: any;
+  private busy = "";
 
-	constructor(tui: any, theme: any, done: (result?: unknown) => void, ctx: any) {
-		this.tui = tui;
-		this.theme = theme;
-		this.done = done;
-		this.ctx = ctx;
-		void this.init();
-	}
+  constructor(
+    tui: any,
+    theme: any,
+    done: (result?: unknown) => void,
+    ctx: any,
+  ) {
+    this.tui = tui;
+    this.theme = theme;
+    this.done = done;
+    this.ctx = ctx;
+    void this.init();
+  }
 
-	private dim(s: string) {
-		return this.theme.fg("muted", s);
-	}
-	private bold(s: string) {
-		return this.theme.bold(s);
-	}
-	private accent(s: string) {
-		return this.theme.fg("accent", s);
-	}
+  // styling shorthands
 
-	private async init() {
-		const authStorage = this.ctx.modelRegistry.authStorage;
-		const accounts = getAccounts(authStorage);
-		const activeKey = getActive(authStorage);
+  private dim(s: string): string {
+    return this.theme.fg("muted", s);
+  }
+  private bold(s: string): string {
+    return this.theme.bold(s);
+  }
+  private accent(s: string): string {
+    return this.theme.fg("accent", s);
+  }
 
-		const rows = await Promise.all(
-			accounts.map(async (key): Promise<Row> => {
-				const index = parseInt(key.slice(ACCOUNT_PREFIX.length), 10);
-				const cred = authStorage.get(key);
-				if (!cred) return { key, index, email: "unknown", windows: [], error: "missing", active: key === activeKey };
+  // Fetch usage + metadata for every account concurrently, then render.
+  private async init(): Promise<void> {
+    const authStorage = this.ctx.modelRegistry.authStorage;
+    const accounts = getAccounts(authStorage);
+    const activeKey = getActive(authStorage);
 
-				const apiKey = await resolveApiKey(authStorage, key, cred);
-				if (!apiKey) return { key, index, email: "unknown", windows: [], error: "auth expired", active: key === activeKey };
+    const rows = await Promise.all(
+      accounts.map(async (key): Promise<Row> => {
+        const slotIndex = parseInt(
+          key.slice(ACCOUNT_PREFIX.length),
+          10,
+        );
+        const storedCred = authStorage.get(key);
 
-				const usage = await fetchUsage(apiKey);
-				const email = parseEmailFromJwt(apiKey) ?? usage?.email;
-				const windows: Row["windows"] = [];
-				if (usage?.windows) {
-					const order: Record<string, number> = { week: 0, primary: 1 };
-					for (const [name, win] of Object.entries(usage.windows).sort((a, b) => (order[a[0]] ?? 99) - (order[b[0]] ?? 99))) {
-						const remaining = 100 - win.pct;
-						windows.push({
-							name,
-							pct: win.pct,
-							reset: win.reset,
-							color: remaining <= 10 ? "error" : remaining <= 30 ? "warning" : "success",
-						});
-					}
-				}
-				return {
-					key,
-					index,
-					email: email ?? "unknown",
-					plan: usage?.plan,
-					windows,
-					error: usage ? undefined : "fetch failed",
-					active: key === activeKey,
-				};
-			}),
-		);
+        // no stored credential at all → stale key
+        if (!storedCred) {
+          return {
+            key,
+            index: slotIndex,
+            email: "unknown",
+            windows: [],
+            error: "missing",
+            active: key === activeKey,
+          };
+        }
 
-		this.rows = rows;
-		const activeIndex = rows.findIndex((r) => r.active);
-		if (activeIndex >= 0) this.selected = activeIndex;
-		this.loading = false;
-		this.tui.requestRender();
-	}
+        // resolve a fresh API token
+        const apiKey = await resolveApiKey(authStorage, key, storedCred);
+        if (!apiKey) {
+          return {
+            key,
+            index: slotIndex,
+            email: "unknown",
+            windows: [],
+            error: "auth expired",
+            active: key === activeKey,
+          };
+        }
 
-	handleInput(ev: string): void {
-		if (this.busy) return;
-		if (matchesKey(ev, "escape")) {
-			this.done();
-			return;
-		}
-		if (matchesKey(ev, "up") || ev === "k") {
-			this.selected = Math.max(0, this.selected - 1);
-			this.tui.requestRender();
-			return;
-		}
-		if (matchesKey(ev, "down") || ev === "j") {
-			this.selected = Math.min(this.rows.length - 1, this.selected + 1);
-			this.tui.requestRender();
-			return;
-		}
-		if (matchesKey(ev, "enter")) {
-			void this.withBusy("switch", () => this.doSwitch());
-			return;
-		}
-		if (ev === "a") {
-			void this.withBusy("add", () => this.doAdd());
-			return;
-		}
-		if (matchesKey(ev, "backspace") || matchesKey(ev, "delete")) {
-			void this.withBusy("remove", () => this.doRemove());
-		}
-	}
+        // fetch usage stats
+        const usage = await fetchUsage(apiKey);
+        const email = parseEmailFromJwt(apiKey) ?? usage?.email;
 
-	private async withBusy(label: string, fn: () => Promise<void>) {
-		this.busy = label;
-		this.tui.requestRender();
-		try {
-			await fn();
-		} catch (err) {
-			debug("withBusy error", label, err);
-			this.busy = "";
-			this.tui.requestRender();
-		}
-	}
+        // build per-window bar-chart data
+        const windows: Row["windows"] = [];
+        if (usage?.windows) {
+          const sortOrder: Record<string, number> = {
+            week: 0,
+            primary: 1,
+          };
+          for (const [name, win] of Object.entries(usage.windows).sort(
+            (a, b) =>
+              (sortOrder[a[0]] ?? 99) - (sortOrder[b[0]] ?? 99),
+          )) {
+            const remaining = 100 - win.pct;
+            const color =
+              remaining <= 10
+                ? "error"
+                : remaining <= 30
+                  ? "warning"
+                  : "success";
+            windows.push({
+              name,
+              pct: win.pct,
+              reset: win.reset,
+              color,
+            });
+          }
+        }
 
-	private async doSwitch() {
-		const row = this.rows[this.selected];
-		if (!row) return;
-		const authStorage = this.ctx.modelRegistry.authStorage;
-		const cred = authStorage.get(row.key);
-		if (!cred) return;
-		// Refresh the token before activating so we never switch to a stale credential.
-		if (isExpired(cred)) await resolveApiKey(authStorage, row.key, cred);
-		const fresh = authStorage.get(row.key) ?? cred;
-		setActive(authStorage, row.key, fresh);
-		this.done();
-		await this.ctx.reload();
-	}
+        return {
+          key,
+          index: slotIndex,
+          email: email ?? "unknown",
+          plan: usage?.plan,
+          windows,
+          error: usage ? undefined : "fetch failed",
+          active: key === activeKey,
+        };
+      }),
+    );
 
-	private async doAdd() {
-		try {
-			const creds = await loginOpenAICodex({
-				onAuth: ({ url, instructions }) => {
-					this.ctx.ui.notify(`Open: ${url}`, "info");
-					if (instructions) this.ctx.ui.notify(instructions, "info");
-					void import("node:child_process").then(({ exec }) => {
-						exec(process.platform === "darwin" ? `open '${url}'` : process.platform === "win32" ? `start "" "${url}"` : `xdg-open '${url}'`);
-					});
-				},
-				onPrompt: async ({ message }) => {
-					const v = await this.ctx.ui.input(message);
-					if (!v?.trim()) throw new Error("Cancelled");
-					return v.trim();
-				},
-				onProgress: (msg: string) => this.ctx.ui.notify(msg, "info"),
-				originator: "pi",
-			});
+    this.rows = rows;
+    const activeRowIdx = rows.findIndex((r) => r.active);
+    if (activeRowIdx >= 0) this.selected = activeRowIdx;
+    this.loading = false;
+    this.tui.requestRender();
+  }
 
-			const authStorage = this.ctx.modelRegistry.authStorage;
+  handleInput(ev: string): void {
+    if (this.busy) return;
 
-			let nextIndex = 0;
-			for (const key of getAccounts(authStorage)) {
-				const n = parseInt(key.slice(ACCOUNT_PREFIX.length), 10);
-				if (!isNaN(n) && n >= nextIndex) nextIndex = n + 1;
-			}
+    if (matchesKey(ev, "escape")) {
+      this.done();
+      return;
+    }
 
-			const cred = { type: "oauth", ...creds };
-			authStorage.set(accountKey(nextIndex), cred);
-			setActive(authStorage, accountKey(nextIndex), cred);
+    // navigation
+    if (matchesKey(ev, "up") || ev === "k") {
+      this.selected = Math.max(0, this.selected - 1);
+      this.tui.requestRender();
+      return;
+    }
+    if (matchesKey(ev, "down") || ev === "j") {
+      this.selected = Math.min(
+        this.rows.length - 1,
+        this.selected + 1,
+      );
+      this.tui.requestRender();
+      return;
+    }
 
-			this.ctx.ui.notify(`Added & switched to [${nextIndex}]`, "success");
-		} catch (e: any) {
-			this.ctx.ui.notify(`Failed: ${e?.message || e}`, "error");
-		}
-		this.busy = "";
-		this.loading = true;
-		void this.init().then(() => this.tui.requestRender());
-	}
+    // actions
+    if (matchesKey(ev, "enter")) {
+      void this.withBusy("switch", () => this.doSwitch());
+      return;
+    }
+    if (ev === "a") {
+      void this.withBusy("add", () => this.doAdd());
+      return;
+    }
+    if (matchesKey(ev, "backspace") || matchesKey(ev, "delete")) {
+      void this.withBusy("remove", () => this.doRemove());
+    }
+  }
 
-	private async doRemove() {
-		const row = this.rows[this.selected];
-		if (!row) return;
-		const authStorage = this.ctx.modelRegistry.authStorage;
-		if (row.active) {
-			authStorage.remove(ACTIVE_KEY);
-			authStorage.remove(ACTIVE_POINTER_KEY);
-		}
-		authStorage.remove(row.key);
-		this.busy = "";
-		this.loading = true;
-		void this.init().then(() => {
-			this.selected = Math.min(this.selected, Math.max(0, this.rows.length - 1));
-			this.tui.requestRender();
-		});
-	}
+  private async withBusy(
+    label: string,
+    fn: () => Promise<void>,
+  ): Promise<void> {
+    this.busy = label;
+    this.tui.requestRender();
+    try {
+      await fn();
+    } catch (err) {
+      debug("withBusy error", label, err);
+      this.busy = "";
+      this.tui.requestRender();
+    }
+  }
 
-	invalidate(): void {}
-	dispose(): void {}
+  // Switch active account to the highlighted row.
+  private async doSwitch(): Promise<void> {
+    const row = this.rows[this.selected];
+    if (!row) return;
 
-	render(width: number): string[] {
-		const t = this.theme;
-		const innerWidth = width - 4;
-		const horizontal = "─".repeat(width - 2);
-		const boxLine = (content: string) =>
-			this.dim("│ ") + content + " ".repeat(Math.max(0, innerWidth - content.replace(/\x1b\[[0-9;]*m/g, "").length)) + this.dim(" │");
-		const lines: string[] = [];
+    const authStorage = this.ctx.modelRegistry.authStorage;
+    const cred = authStorage.get(row.key);
+    if (!cred) return;
 
-		if (this.busy) {
-			lines.push(this.dim(`╭${horizontal}╮`), boxLine(this.bold(this.accent("multi-codex"))), this.dim(`├${horizontal}┤`));
-			lines.push(boxLine(`${this.busy}...`));
-			lines.push(this.dim(`╰${horizontal}╯`));
-			return lines;
-		}
+    // refresh the token before activating so we never switch stale
+    if (isExpired(cred)) {
+      await resolveApiKey(authStorage, row.key, cred);
+    }
+    const freshCred = authStorage.get(row.key) ?? cred;
 
-		lines.push(this.dim(`╭${horizontal}╮`), boxLine(this.bold(this.accent("multi-codex"))), this.dim(`├${horizontal}┤`));
+    setActive(authStorage, row.key, freshCred);
+    this.done();
+    await this.ctx.reload();
+  }
 
-		if (this.loading) {
-			lines.push(boxLine("loading..."));
-		} else if (!this.rows.length) {
-			lines.push(boxLine("no accounts"), boxLine(""), boxLine(this.dim("a  add account")));
-		} else {
-			for (let i = 0; i < this.rows.length; i++) {
-				const row = this.rows[i];
-				const planLabel = row.plan ? t.fg("accent", ` ${row.plan}`) : "";
-				lines.push(
-					boxLine(
-						`${i === this.selected ? t.fg("accent", "▸ ") : "  "}${this.bold(`[${row.index}]`)} ${row.email}${planLabel}${row.active ? t.fg("success", " ●") : ""}`,
-					),
-				);
-				if (row.error) {
-					lines.push(boxLine(this.dim(`   ${row.error}`)));
-					continue;
-				}
-				for (const win of row.windows) {
-					const filled = Math.min(10, Math.round(win.pct / 10));
-					const empty = 10 - filled;
-					const bar = t.fg(win.color, "█".repeat(filled)) + this.dim("░".repeat(empty));
-					const resetLabel = win.reset ? this.dim(` ${formatReset(new Date(win.reset))}`) : "";
-					lines.push(boxLine(`   ${win.name.padEnd(8)} ${bar} ${win.pct.toFixed(0).padStart(3)}%${resetLabel}`));
-				}
-			}
-		}
+  // Add a new account via OAuth.  Opens the browser, stores the credential
+  // in the next free slot, and switches to it.
+  private async doAdd(): Promise<void> {
+    try {
+      const creds = await loginOpenAICodex({
+        onAuth: ({ url, instructions }) => {
+          this.ctx.ui.notify(`Open: ${url}`, "info");
+          if (instructions) this.ctx.ui.notify(instructions, "info");
 
-		lines.push(
-			this.dim(`├${horizontal}┤`),
-			boxLine(this.dim("↑↓ select  a add  ↵ switch  ⌫ remove  esc close")),
-			this.dim(`╰${horizontal}╯`),
-		);
-		return lines;
-	}
+          // open the auth URL in the user's browser
+          void import("node:child_process").then(({ exec }) => {
+            let openCmd: string;
+            if (process.platform === "darwin") {
+              openCmd = `open '${url}'`;
+            } else if (process.platform === "win32") {
+              openCmd = `start "" "${url}"`;
+            } else {
+              openCmd = `xdg-open '${url}'`;
+            }
+            exec(openCmd);
+          });
+        },
+        onPrompt: async ({ message }) => {
+          const v = await this.ctx.ui.input(message);
+          if (!v?.trim()) throw new Error("Cancelled");
+          return v.trim();
+        },
+        onProgress: (msg: string) =>
+          this.ctx.ui.notify(msg, "info"),
+        originator: "pi",
+      });
+
+      const authStorage = this.ctx.modelRegistry.authStorage;
+
+      // find the next free slot index
+      let nextSlot = 0;
+      for (const key of getAccounts(authStorage)) {
+        const parsed = parseInt(key.slice(ACCOUNT_PREFIX.length), 10);
+        if (!isNaN(parsed) && parsed >= nextSlot) nextSlot = parsed + 1;
+      }
+
+      const cred = { type: "oauth", ...creds };
+      authStorage.set(accountKey(nextSlot), cred);
+      setActive(authStorage, accountKey(nextSlot), cred);
+      this.ctx.ui.notify(
+        `Added & switched to [${nextSlot}]`,
+        "success",
+      );
+    } catch (e: any) {
+      this.ctx.ui.notify(
+        `Failed: ${e?.message || e}`,
+        "error",
+      );
+    }
+
+    // reload the list
+    this.busy = "";
+    this.loading = true;
+    void this.init().then(() => this.tui.requestRender());
+  }
+
+  // Remove the highlighted account from storage.
+  private async doRemove(): Promise<void> {
+    const row = this.rows[this.selected];
+    if (!row) return;
+
+    const authStorage = this.ctx.modelRegistry.authStorage;
+
+    // also remove active markers if removing the active account
+    if (row.active) {
+      authStorage.remove(ACTIVE_KEY);
+      authStorage.remove(ACTIVE_POINTER_KEY);
+    }
+    authStorage.remove(row.key);
+
+    this.busy = "";
+    this.loading = true;
+    void this.init().then(() => {
+      this.selected = Math.min(
+        this.selected,
+        Math.max(0, this.rows.length - 1),
+      );
+      this.tui.requestRender();
+    });
+  }
+
+  // ── lifecycle stubs ──────────────────────────────────────────────────
+
+  invalidate(): void {}
+  dispose(): void {}
+
+  // ── rendering ─────────────────────────────────────────────────────────
+
+  render(width: number): string[] {
+    const t = this.theme;
+    const innerWidth = width - 4;
+    const horizontal = "─".repeat(width - 2);
+
+    // box-line helper: pads content to fill inner width
+    const boxLine = (content: string): string => {
+      const visibleLen = content.replace(
+        /\x1b\[[0-9;]*m/g,
+        "",
+      ).length;
+      return (
+        this.dim("│ ") +
+        content +
+        " ".repeat(Math.max(0, innerWidth - visibleLen)) +
+        this.dim(" │")
+      );
+    };
+
+    const lines: string[] = [];
+
+    // busy state — show only title + spinner
+    if (this.busy) {
+      lines.push(
+        this.dim(`╭${horizontal}╮`),
+        boxLine(this.bold(this.accent("multi-codex"))),
+        this.dim(`├${horizontal}┤`),
+        boxLine(`${this.busy}...`),
+        this.dim(`╰${horizontal}╯`),
+      );
+      return lines;
+    }
+
+    // header
+    lines.push(
+      this.dim(`╭${horizontal}╮`),
+      boxLine(this.bold(this.accent("multi-codex"))),
+      this.dim(`├${horizontal}┤`),
+    );
+
+    // body
+    if (this.loading) {
+      lines.push(boxLine("loading..."));
+    } else if (!this.rows.length) {
+      lines.push(
+        boxLine("no accounts"),
+        boxLine(""),
+        boxLine(this.dim("a  add account")),
+      );
+    } else {
+      for (let i = 0; i < this.rows.length; i++) {
+        const row = this.rows[i];
+
+        // account header line
+        const cursor =
+          i === this.selected ? t.fg("accent", "▸ ") : "  ";
+        const planLabel = row.plan
+          ? t.fg("accent", ` ${row.plan}`)
+          : "";
+        const activeDot = row.active
+          ? t.fg("success", " ●")
+          : "";
+
+        lines.push(
+          boxLine(
+            `${cursor}` +
+              `${this.bold(`[${row.index}]`)} ${row.email}` +
+              `${planLabel}${activeDot}`,
+          ),
+        );
+
+        // error or usage bars
+        if (row.error) {
+          lines.push(boxLine(this.dim(`   ${row.error}`)));
+          continue;
+        }
+
+        for (const win of row.windows) {
+          const filled = Math.min(10, Math.round(win.pct / 10));
+          const empty = 10 - filled;
+          const bar =
+            t.fg(win.color, "█".repeat(filled)) +
+            this.dim("░".repeat(empty));
+
+          const pctStr = `${win.pct.toFixed(0).padStart(3)}%`;
+          const resetStr = win.reset
+            ? this.dim(` ${formatReset(new Date(win.reset))}`)
+            : "";
+
+          lines.push(
+            boxLine(
+              `   ${win.name.padEnd(8)} ${bar} ${pctStr}${resetStr}`,
+            ),
+          );
+        }
+      }
+    }
+
+    // footer
+    lines.push(
+      this.dim(`├${horizontal}┤`),
+      boxLine(
+        this.dim(
+          "↑↓ select  a add  ↵ switch  ⌫ remove  esc close",
+        ),
+      ),
+      this.dim(`╰${horizontal}╯`),
+    );
+
+    return lines;
+  }
 }
+
+// ── Relative time formatter ─────────────────────────────────────────────────
 
 function formatReset(date: Date): string {
-	const diff = date.getTime() - Date.now();
-	if (diff < 0) return "now";
-	const minutes = Math.floor(diff / 60000);
-	if (minutes < 60) return `in ${minutes}m`;
-	const hours = Math.floor(minutes / 60);
-	if (hours < 24) return `in ${hours}h${minutes % 60 ? ` ${minutes % 60}m` : ""}`;
-	return `in ${Math.floor(hours / 24)}d`;
+  const diff = date.getTime() - Date.now();
+  if (diff < 0) return "now";
+
+  const minutes = Math.floor(diff / 60_000);
+  if (minutes < 60) return `in ${minutes}m`;
+
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    const remainderMin = minutes % 60;
+    const suffix = remainderMin ? ` ${remainderMin}m` : "";
+    return `in ${hours}h${suffix}`;
+  }
+
+  return `in ${Math.floor(hours / 24)}d`;
 }
 
+// ── Extension entry point ───────────────────────────────────────────────────
+
 export default function (pi: ExtensionAPI) {
-	pi.on("session_start", async (_event, ctx) => {
-		const authStorage = ctx.modelRegistry.authStorage;
-		for (const key of authStorage.list?.() ?? []) {
-			if (key === ACTIVE_POINTER_KEY) continue;
-			if (key.startsWith(ACCOUNT_PREFIX) || key === ACTIVE_KEY) {
-				try {
-					await authStorage.getApiKey(key);
-				} catch (err) {
-					debug("session_start refresh failed", key, err);
-				}
-			}
-		}
-	});
+  // Refresh all account tokens on session start.
+  pi.on("session_start", async (_event, ctx) => {
+    const authStorage = ctx.modelRegistry.authStorage;
+    for (const key of authStorage.list?.() ?? []) {
+      if (key === ACTIVE_POINTER_KEY) continue;
+      if (
+        key.startsWith(ACCOUNT_PREFIX) ||
+        key === ACTIVE_KEY
+      ) {
+        try {
+          await authStorage.getApiKey(key);
+        } catch (err) {
+          debug("session_start refresh failed", key, err);
+        }
+      }
+    }
+  });
 
-	pi.on("message_end", async (event, ctx) => {
-		if (event.message.role !== "assistant") return;
-		const msg = event.message as any;
-		if (msg.stopReason !== "error") return;
-		const errorMessage = msg.errorMessage ?? "";
-		if (!/usage.limit/i.test(errorMessage)) return;
+  // Auto-switch on rate-limit errors.
+  pi.on("message_end", async (event, ctx) => {
+    if (event.message.role !== "assistant") return;
 
-		const authStorage = ctx.modelRegistry.authStorage;
-		const accounts = getAccounts(authStorage);
-		if (accounts.length <= 1) return;
+    const msg = event.message as any;
+    if (msg.stopReason !== "error") return;
 
-		const activeKey = getActive(authStorage);
+    const errorMessage: string = msg.errorMessage ?? "";
+    if (!/usage.limit/i.test(errorMessage)) return;
 
-		// Score accounts in parallel: prefer capacity first, then soonest reset.
-		const scored = (
-			await Promise.all(
-				accounts.map(async (key) => {
-					const cred = authStorage.get(key);
-					if (!cred) return null;
-					const apiKey = await resolveApiKey(authStorage, key, cred);
-					if (!apiKey) return null;
-					const usage = await fetchUsage(apiKey);
-					if (!usage?.windows) return null;
+    const authStorage = ctx.modelRegistry.authStorage;
+    const accounts = getAccounts(authStorage);
+    if (accounts.length <= 1) return;   // nothing to switch to
 
-					const now = Date.now();
-					const primary = usage.windows["primary"];
-					const week = usage.windows["week"];
-					const primaryPct = primary?.reset && primary.reset <= now ? 0 : (primary?.pct ?? 0);
-					const weekPct = week?.reset && week.reset <= now ? 0 : (week?.pct ?? 0);
-					const pct = Math.max(primaryPct, weekPct);
-					const reset = Math.min(primary?.reset ?? Infinity, week?.reset ?? Infinity);
-					return { key, pct, reset, cred: authStorage.get(key) ?? cred };
-				}),
-			)
-		).filter((s): s is { key: string; pct: number; reset: number; cred: any } => s !== null);
+    const activeKey = getActive(authStorage);
 
-		if (scored.length === 0) return;
+    // score every account in parallel
+    const scored = (
+      await Promise.all(
+        accounts.map(async (key) => {
+          const cred = authStorage.get(key);
+          if (!cred) return null;
 
-		scored.sort((a, b) => {
-			const aHasCapacity = a.pct < 100 ? 0 : 1;
-			const bHasCapacity = b.pct < 100 ? 0 : 1;
-			if (aHasCapacity !== bHasCapacity) return aHasCapacity - bHasCapacity;
-			return a.reset - b.reset;
-		});
+          const apiKey = await resolveApiKey(
+            authStorage,
+            key,
+            cred,
+          );
+          if (!apiKey) return null;
 
-		const best = scored.find((s) => s.key !== activeKey) ?? scored[0];
+          const usage = await fetchUsage(apiKey);
+          if (!usage?.windows) return null;
 
-		if (best.pct >= 100) {
-			ctx.ui.notify("All accounts rate-limited — wait for reset", "error");
-			return;
-		}
+          const now = Date.now();
 
-		setActive(authStorage, best.key, best.cred);
-		const resetDate = new Date(best.reset);
-		ctx.ui.notify(
-			`Switched to [${best.key.slice(ACCOUNT_PREFIX.length)}] (resets ${resetDate.getHours()}:${String(resetDate.getMinutes()).padStart(2, "0")})`,
-			"warning",
-		);
+          const primary = usage.windows["primary"];
+          const week = usage.windows["week"];
 
-		const entries = ctx.sessionManager.getEntries();
-		for (let i = entries.length - 1; i >= 0; i--) {
-			const entry = entries[i];
-			if (entry.type === "message" && entry.message.role === "user") {
-				pi.sendUserMessage(entry.message.content, { deliverAs: "followUp" });
-				break;
-			}
-		}
-	});
+          // Treat a window as 0% if it already reset
+          const primaryPct =
+            primary?.reset && primary.reset <= now
+              ? 0
+              : (primary?.pct ?? 0);
+          const weekPct =
+            week?.reset && week.reset <= now
+              ? 0
+              : (week?.pct ?? 0);
 
-	pi.registerCommand("multi-codex", {
-		description: "Manage multiple OpenAI Codex accounts",
-		handler: async (_args, ctx) => {
-			await ctx.ui.custom((tu: any, th: any, _kb: any, done: (result?: unknown) => void) => new List(tu, th, done, ctx));
-		},
-	});
+          // The "worst" window determines the account's effective usage
+          const usagePct = Math.max(primaryPct, weekPct);
+          const resetAt = Math.min(
+            primary?.reset ?? Infinity,
+            week?.reset ?? Infinity,
+          );
+
+          return {
+            key,
+            pct: usagePct,
+            reset: resetAt,
+            cred: authStorage.get(key) ?? cred,
+          };
+        }),
+      )
+    ).filter(
+      (
+        s,
+      ): s is {
+        key: string;
+        pct: number;
+        reset: number;
+        cred: any;
+      } => s !== null,
+    );
+
+    if (scored.length === 0) return;
+
+    // sort: accounts with capacity first, then soonest reset
+    scored.sort((a, b) => {
+      const aExhausted = a.pct >= 100 ? 1 : 0;
+      const bExhausted = b.pct >= 100 ? 1 : 0;
+      if (aExhausted !== bExhausted) return aExhausted - bExhausted;
+      return a.reset - b.reset;
+    });
+
+    // prefer a different account, but fall back to the same one
+    const best =
+      scored.find((s) => s.key !== activeKey) ?? scored[0];
+
+    if (best.pct >= 100) {
+      ctx.ui.notify(
+        "All accounts rate-limited — wait for reset",
+        "error",
+      );
+      return;
+    }
+
+    setActive(authStorage, best.key, best.cred);
+
+    const resetDate = new Date(best.reset);
+    ctx.ui.notify(
+      `Switched to [${best.key.slice(ACCOUNT_PREFIX.length)}] ` +
+        `(resets ${resetDate.getHours()}:` +
+        `${String(resetDate.getMinutes()).padStart(2, "0")})`,
+      "warning",
+    );
+
+    // find and re-send the last user message
+    const entries = ctx.sessionManager.getEntries();
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = entries[i];
+      if (
+        entry.type === "message" &&
+        entry.message.role === "user"
+      ) {
+        pi.sendUserMessage(entry.message.content, {
+          deliverAs: "followUp",
+        });
+        break;
+      }
+    }
+  });
+
+  // Register the `multi-codex` command to open the TUI.
+  pi.registerCommand("multi-codex", {
+    description: "Manage multiple OpenAI Codex accounts",
+    handler: async (_args, ctx) => {
+      await ctx.ui.custom(
+        (
+          tu: any,
+          th: any,
+          _kb: any,
+          done: (result?: unknown) => void,
+        ) => new List(tu, th, done, ctx),
+      );
+    },
+  });
 }
