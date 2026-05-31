@@ -72,7 +72,7 @@ async function fetchUsage(apiKey: string): Promise<UsageResult | "unauthorized" 
 		}
 
 		let plan: string | undefined;
-		if (data.plan_type && data.plan_type !== "free") plan = data.plan_type;
+		if (data.plan_type) plan = data.plan_type;
 
 		const email = typeof data.email === "string" ? data.email : undefined;
 
@@ -83,19 +83,22 @@ async function fetchUsage(apiKey: string): Promise<UsageResult | "unauthorized" 
 	}
 }
 
-function parseEmailFromJwt(apiKey: string): string | undefined {
+function parseProfileFromJwt(apiKey: string): { email?: string; plan?: string } {
 	try {
 		const [, payloadB64] = apiKey.split(".");
-		if (!payloadB64) return undefined;
+		if (!payloadB64) return {};
 
 		const decoded = JSON.parse(
 			Buffer.from(payloadB64, "base64url").toString("utf8"),
 		);
 
-		return decoded?.["https://api.openai.com/profile"]?.email as string | undefined;
+		return {
+			email: decoded?.["https://api.openai.com/profile"]?.email as string | undefined,
+			plan: decoded?.["https://api.openai.com/auth"]?.chatgpt_plan_type as string | undefined,
+		};
 	} catch (error) {
-		debug("parseEmailFromJwt error", error);
-		return undefined;
+		debug("parseProfileFromJwt error", error);
+		return {};
 	}
 }
 
@@ -292,7 +295,9 @@ class AccountList implements Component {
 			}
 
 			const usageData = usage; // null = fetch failed, UsageResult = ok
-			const email = parseEmailFromJwt(apiKey) ?? usageData?.email;
+			const jwtProfile = parseProfileFromJwt(apiKey);
+			const email = jwtProfile.email ?? usageData?.email;
+			const plan = usageData?.plan ?? jwtProfile.plan;
 			const usageWindows: UsageWindowRow[] = [];
 
 			if (usageData?.windows) {
@@ -314,7 +319,7 @@ class AccountList implements Component {
 				key: accountKey,
 				index: accountIndex,
 				email: email ?? "unknown",
-				plan: usageData?.plan,
+				plan,
 				usageWindows,
 				error: usageData ? undefined : "fetch failed",
 				active: accountKey === activeKey,
