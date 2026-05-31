@@ -654,7 +654,14 @@ export default function (pi: ExtensionAPI) {
 		const best = scored.find((entry) => entry.key !== activeKey) ?? scored[0];
 
 		if (best.percent >= 100) {
-			context.ui.notify("All accounts rate-limited — wait for reset", "error");
+			const soonestReset = scored
+				.map((entry) => entry.reset)
+				.filter((reset) => Number.isFinite(reset))
+				.sort((first, second) => first - second)[0];
+			const resetMessage = soonestReset
+				? ` — soonest reset ${formatCountdown(new Date(soonestReset))}`
+				: "";
+			context.ui.notify(`All accounts rate-limited${resetMessage}`, "error");
 			return;
 		}
 
