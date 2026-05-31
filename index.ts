@@ -2,134 +2,260 @@ import { loginOpenAICodex } from "@earendil-works/pi-ai/oauth";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
 
-const PF = "openai-codex-";
-const ACT = "openai-codex";
-const TO = 10000;
+const ACCOUNT_PREFIX = "openai-codex-";
+const ACTIVE_KEY = "openai-codex";
+/** Separate pointer that records WHICH numbered account is currently active. */
+const ACTIVE_POINTER_KEY = "openai-codex-active";
+const FETCH_TIMEOUT_MS = 10000;
 
-async function fetchUsage(ak: string) {
-	try {
-		const r = await fetch("https://chatgpt.com/backend-api/wham/usage", {
-			headers: { Authorization: `Bearer ${ak}`, "User-Agent": "pi-agent", Accept: "application/json" },
-			signal: AbortSignal.timeout(TO),
-		});
-		if (!r.ok) return null;
-		const d = (await r.json()) as any;
-		const w: Record<string, { pct: number; reset?: number }> = {};
-		const rw = [d.rate_limit?.primary_window, d.rate_limit?.secondary_window].filter(Boolean);
-		const ww = rw[rw.length - 1], pw = rw.length > 1 ? rw[0] : undefined;
-		if (ww) w["week"] = { pct: ww.used_percent || 0, reset: ww.reset_at ? ww.reset_at * 1000 : undefined };
-		if (pw) w["primary"] = { pct: pw.used_percent || 0, reset: pw.reset_at ? pw.reset_at * 1000 : undefined };
-		let plan: string | undefined;
-		if (d.plan_type && d.plan_type !== "free") plan = d.plan_type;
-		return { w, plan };
-	} catch { return null; }
+const DEBUG = !!process.env.MULTI_CODEX_DEBUG;
+function debug(...args: unknown[]) {
+	if (DEBUG) console.error("[multi-codex]", ...args);
 }
 
-function parseEmailFromJwt(ak: string): string | undefined {
+interface UsageWindow {
+	pct: number;
+	reset?: number;
+}
+
+interface UsageResult {
+	windows: Record<string, UsageWindow>;
+	plan?: string;
+	email?: string;
+}
+
+async function fetchUsage(apiKey: string): Promise<UsageResult | null> {
 	try {
-		const payload = ak.split(".")[1];
+		const res = await fetch("https://chatgpt.com/backend-api/wham/usage", {
+			headers: { Authorization: `Bearer ${apiKey}`, "User-Agent": "pi-agent", Accept: "application/json" },
+			signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+		});
+		if (!res.ok) {
+			debug("fetchUsage non-ok", res.status);
+			return null;
+		}
+		const data = (await res.json()) as any;
+		const windows: Record<string, UsageWindow> = {};
+		// The API returns named windows; label each by its actual duration rather than
+		// array position. Windows < ~1 day are the short ("primary") limit; longer ones
+		// are the rolling weekly ("week") limit. Either may be null/absent.
+		const DAY_SECONDS = 86400;
+		for (const raw of [data.rate_limit?.primary_window, data.rate_limit?.secondary_window]) {
+			if (!raw) continue;
+			const durationSeconds = raw.limit_window_seconds ?? 0;
+			const name = durationSeconds > 0 && durationSeconds < DAY_SECONDS ? "primary" : "week";
+			windows[name] = { pct: raw.used_percent || 0, reset: raw.reset_at ? raw.reset_at * 1000 : undefined };
+		}
+		let plan: string | undefined;
+		if (data.plan_type && data.plan_type !== "free") plan = data.plan_type;
+		const email = typeof data.email === "string" ? data.email : undefined;
+		return { windows, plan, email };
+	} catch (err) {
+		debug("fetchUsage error", err);
+		return null;
+	}
+}
+
+function parseEmailFromJwt(apiKey: string): string | undefined {
+	try {
+		const payload = apiKey.split(".")[1];
 		if (!payload) return undefined;
 		const decoded = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
 		return decoded?.["https://api.openai.com/profile"]?.email as string | undefined;
-	} catch { return undefined; }
+	} catch (err) {
+		debug("parseEmailFromJwt error", err);
+		return undefined;
+	}
 }
 
-async function fetchProfile(ak: string) {
-	const email = parseEmailFromJwt(ak);
-	if (email) return email;
-	try {
-		const r = await fetch("https://api.openai.com/v1/me", { headers: { Authorization: `Bearer ${ak}` }, signal: AbortSignal.timeout(TO) });
-		return r.ok ? ((await r.json()) as any)?.email as string | undefined : undefined;
-	} catch { return undefined; }
+function accountKey(index: number): string {
+	return `${ACCOUNT_PREFIX}${index}`;
 }
 
-function pn(n: number) { return `${PF}${n}`; }
-
-function getAccounts(as: any): string[] {
-	return (as.list?.() ?? []).filter((k: string) => k.startsWith(PF)).sort();
+function getAccounts(authStorage: any): string[] {
+	return ((authStorage.list?.() ?? []) as string[]).filter((k) => k.startsWith(ACCOUNT_PREFIX) && k !== ACTIVE_POINTER_KEY).sort();
 }
 
-function getActive(as: any): string | undefined {
-	const cred = as.get(ACT);
-	if (!cred) return undefined;
-	for (const k of getAccounts(as)) {
-		const v = as.get(k);
-		if (v && v.type === cred.type && v.access === cred.access) return k;
+/** True when a credential has no valid (future) expiry and must be refreshed. */
+function isExpired(cred: any): boolean {
+	const expires = cred?.expires;
+	if (typeof expires !== "number") return true;
+	return Date.now() >= expires;
+}
+
+/**
+ * Resolve a usable API key for an account, refreshing via getApiKey when the
+ * stored token is missing or expired.
+ */
+async function resolveApiKey(authStorage: any, key: string, cred: any): Promise<string | undefined> {
+	if (cred && !isExpired(cred) && typeof cred.access === "string") return cred.access;
+	return authStorage.getApiKey(key).catch((err: unknown) => {
+		debug("resolveApiKey error", key, err);
+		return undefined;
+	});
+}
+
+/**
+ * Determine the active account key. Prefers the explicit pointer; falls back to
+ * value-comparison against the legacy active credential for backward compat.
+ */
+function getActive(authStorage: any): string | undefined {
+	const pointer = authStorage.get(ACTIVE_POINTER_KEY) as any;
+	const pointerKey = pointer?.type === "api_key" ? pointer.key : undefined;
+	if (typeof pointerKey === "string" && authStorage.get(pointerKey)) return pointerKey;
+
+	const active = authStorage.get(ACTIVE_KEY);
+	if (!active) return undefined;
+	for (const key of getAccounts(authStorage)) {
+		const v = authStorage.get(key);
+		if (v && v.type === active.type && v.access === active.access) return key;
 	}
 	return undefined;
 }
 
+/** Mark an account as active: copy its credential to ACTIVE_KEY and record the pointer. */
+function setActive(authStorage: any, key: string, cred: any): void {
+	authStorage.set(ACTIVE_KEY, cred);
+	authStorage.set(ACTIVE_POINTER_KEY, { type: "api_key", key });
+}
+
 interface Row {
-	key: string; i: number; email: string; plan?: string; win: Array<{ n: string; pct: number; reset?: number; clr: string }>; err?: string; active: boolean;
+	key: string;
+	index: number;
+	email: string;
+	plan?: string;
+	windows: Array<{ name: string; pct: number; reset?: number; color: string }>;
+	error?: string;
+	active: boolean;
 }
 
 class List {
-	private rs: Row[] = [];
+	private rows: Row[] = [];
 	private loading = true;
-	private sel = 0;
-	private tu: { requestRender: () => void };
-	private th: any;
-	private done: () => void;
+	private selected = 0;
+	private tui: { requestRender: () => void };
+	private theme: any;
+	private done: (result?: unknown) => void;
 	private ctx: any;
 	private busy = "";
 
-	constructor(tu: any, th: any, done: () => void, ctx: any) {
-		this.tu = tu; this.th = th; this.done = done; this.ctx = ctx; void this.init();
+	constructor(tui: any, theme: any, done: (result?: unknown) => void, ctx: any) {
+		this.tui = tui;
+		this.theme = theme;
+		this.done = done;
+		this.ctx = ctx;
+		void this.init();
 	}
 
-	private d(s: string) { return this.th.fg("muted", s); }
-	private b(s: string) { return this.th.bold(s); }
-	private a(s: string) { return this.th.fg("accent", s); }
+	private dim(s: string) {
+		return this.theme.fg("muted", s);
+	}
+	private bold(s: string) {
+		return this.theme.bold(s);
+	}
+	private accent(s: string) {
+		return this.theme.fg("accent", s);
+	}
 
 	private async init() {
-		const as = this.ctx.modelRegistry.authStorage;
-		const accounts = getAccounts(as);
-		const activeKey = getActive(as);
-		const rs: Row[] = [];
+		const authStorage = this.ctx.modelRegistry.authStorage;
+		const accounts = getAccounts(authStorage);
+		const activeKey = getActive(authStorage);
 
-		for (const k of accounts) {
-			const i = parseInt(k.slice(PF.length), 10);
-			const v = as.get(k);
-			if (!v) continue;
+		const rows = await Promise.all(
+			accounts.map(async (key): Promise<Row> => {
+				const index = parseInt(key.slice(ACCOUNT_PREFIX.length), 10);
+				const cred = authStorage.get(key);
+				if (!cred) return { key, index, email: "unknown", windows: [], error: "missing", active: key === activeKey };
 
-			const ak = (Date.now() >= (v as any).expires) ? await as.getApiKey(k).catch(() => undefined) : (v as any).access;
-			if (!ak) { rs.push({ key: k, i, email: "unknown", win: [], err: "auth expired", active: k === activeKey }); continue; }
+				const apiKey = await resolveApiKey(authStorage, key, cred);
+				if (!apiKey) return { key, index, email: "unknown", windows: [], error: "auth expired", active: key === activeKey };
 
-			const [u, p] = await Promise.all([fetchUsage(ak), fetchProfile(ak)]);
-			const wins: Row["win"] = [];
-			if (u?.w) for (const [wn, wd] of Object.entries(u.w).sort((a, b) => ({ week: 0, primary: 1 } as any)[a[0]] - ({ week: 0, primary: 1 } as any)[b[0]])) {
-				const rem = 100 - wd.pct;
-				wins.push({ n: wn, pct: wd.pct, reset: wd.reset, clr: rem <= 10 ? "error" : rem <= 30 ? "warning" : "success" });
-			}
-			rs.push({ key: k, i, email: p ?? "unknown", plan: u?.plan, win: wins, err: u ? undefined : "fetch failed", active: k === activeKey });
-		}
+				const usage = await fetchUsage(apiKey);
+				const email = parseEmailFromJwt(apiKey) ?? usage?.email;
+				const windows: Row["windows"] = [];
+				if (usage?.windows) {
+					const order: Record<string, number> = { week: 0, primary: 1 };
+					for (const [name, win] of Object.entries(usage.windows).sort((a, b) => (order[a[0]] ?? 99) - (order[b[0]] ?? 99))) {
+						const remaining = 100 - win.pct;
+						windows.push({
+							name,
+							pct: win.pct,
+							reset: win.reset,
+							color: remaining <= 10 ? "error" : remaining <= 30 ? "warning" : "success",
+						});
+					}
+				}
+				return {
+					key,
+					index,
+					email: email ?? "unknown",
+					plan: usage?.plan,
+					windows,
+					error: usage ? undefined : "fetch failed",
+					active: key === activeKey,
+				};
+			}),
+		);
 
-		this.rs = rs;
-		const ai = rs.findIndex(r => r.active);
-		if (ai >= 0) this.sel = ai;
-		this.loading = false; this.tu.requestRender();
+		this.rows = rows;
+		const activeIndex = rows.findIndex((r) => r.active);
+		if (activeIndex >= 0) this.selected = activeIndex;
+		this.loading = false;
+		this.tui.requestRender();
 	}
 
 	handleInput(ev: string): void {
 		if (this.busy) return;
-		if (matchesKey(ev, "escape")) { this.done(); return; }
-		if (matchesKey(ev, "up") || ev === "k") { this.sel = Math.max(0, this.sel - 1); this.tu.requestRender(); return; }
-		if (matchesKey(ev, "down") || ev === "j") { this.sel = Math.min(this.rs.length - 1, this.sel + 1); this.tu.requestRender(); return; }
-		if (matchesKey(ev, "enter")) { void this.withBusy("switch", () => this.doSwitch()); return; }
-		if (ev === "a") { void this.withBusy("add", () => this.doAdd()); return; }
-		if (matchesKey(ev, "backspace") || matchesKey(ev, "delete")) { void this.withBusy("remove", () => this.doRemove()); }
+		if (matchesKey(ev, "escape")) {
+			this.done();
+			return;
+		}
+		if (matchesKey(ev, "up") || ev === "k") {
+			this.selected = Math.max(0, this.selected - 1);
+			this.tui.requestRender();
+			return;
+		}
+		if (matchesKey(ev, "down") || ev === "j") {
+			this.selected = Math.min(this.rows.length - 1, this.selected + 1);
+			this.tui.requestRender();
+			return;
+		}
+		if (matchesKey(ev, "enter")) {
+			void this.withBusy("switch", () => this.doSwitch());
+			return;
+		}
+		if (ev === "a") {
+			void this.withBusy("add", () => this.doAdd());
+			return;
+		}
+		if (matchesKey(ev, "backspace") || matchesKey(ev, "delete")) {
+			void this.withBusy("remove", () => this.doRemove());
+		}
 	}
 
 	private async withBusy(label: string, fn: () => Promise<void>) {
-		this.busy = label; this.tu.requestRender();
-		try { await fn(); } catch { this.busy = ""; this.tu.requestRender(); }
+		this.busy = label;
+		this.tui.requestRender();
+		try {
+			await fn();
+		} catch (err) {
+			debug("withBusy error", label, err);
+			this.busy = "";
+			this.tui.requestRender();
+		}
 	}
 
 	private async doSwitch() {
-		const r = this.rs[this.sel]; if (!r) return;
-		const as = this.ctx.modelRegistry.authStorage;
-		const cred = as.get(r.key);
-		if (cred) as.set(ACT, cred);
+		const row = this.rows[this.selected];
+		if (!row) return;
+		const authStorage = this.ctx.modelRegistry.authStorage;
+		const cred = authStorage.get(row.key);
+		if (!cred) return;
+		// Refresh the token before activating so we never switch to a stale credential.
+		if (isExpired(cred)) await resolveApiKey(authStorage, row.key, cred);
+		const fresh = authStorage.get(row.key) ?? cred;
+		setActive(authStorage, row.key, fresh);
 		this.done();
 		await this.ctx.reload();
 	}
@@ -153,78 +279,121 @@ class List {
 				originator: "pi",
 			});
 
-			const as = this.ctx.modelRegistry.authStorage;
+			const authStorage = this.ctx.modelRegistry.authStorage;
 
-			let idx = 0;
-			for (const k of as.list()) {
-				if (k.startsWith(PF)) { const n = parseInt(k.slice(PF.length), 10); if (!isNaN(n) && n >= idx) idx = n + 1; }
+			let nextIndex = 0;
+			for (const key of getAccounts(authStorage)) {
+				const n = parseInt(key.slice(ACCOUNT_PREFIX.length), 10);
+				if (!isNaN(n) && n >= nextIndex) nextIndex = n + 1;
 			}
 
-			as.set(pn(idx), { type: "oauth", ...creds });
-			as.set(ACT, { type: "oauth", ...creds });
+			const cred = { type: "oauth", ...creds };
+			authStorage.set(accountKey(nextIndex), cred);
+			setActive(authStorage, accountKey(nextIndex), cred);
 
-			this.ctx.ui.notify(`Added & switched to [${idx}]`, "success");
-		} catch (e: any) { this.ctx.ui.notify(`Failed: ${e?.message || e}`, "error"); }
-		this.busy = ""; this.loading = true; void this.init().then(() => { this.tu.requestRender(); });
+			this.ctx.ui.notify(`Added & switched to [${nextIndex}]`, "success");
+		} catch (e: any) {
+			this.ctx.ui.notify(`Failed: ${e?.message || e}`, "error");
+		}
+		this.busy = "";
+		this.loading = true;
+		void this.init().then(() => this.tui.requestRender());
 	}
 
 	private async doRemove() {
-		const r = this.rs[this.sel]; if (!r) return;
-		const as = this.ctx.modelRegistry.authStorage;
-		if (r.active) as.remove(ACT);
-		as.remove(r.key);
-		this.busy = ""; this.loading = true; void this.init().then(() => { this.sel = Math.min(this.sel, this.rs.length - 1); this.tu.requestRender(); });
+		const row = this.rows[this.selected];
+		if (!row) return;
+		const authStorage = this.ctx.modelRegistry.authStorage;
+		if (row.active) {
+			authStorage.remove(ACTIVE_KEY);
+			authStorage.remove(ACTIVE_POINTER_KEY);
+		}
+		authStorage.remove(row.key);
+		this.busy = "";
+		this.loading = true;
+		void this.init().then(() => {
+			this.selected = Math.min(this.selected, Math.max(0, this.rows.length - 1));
+			this.tui.requestRender();
+		});
 	}
 
 	invalidate(): void {}
 	dispose(): void {}
 
-	render(w: number): string[] {
-		const t = this.th, iw = w - 4, hl = "─".repeat(w - 2);
-		const bx = (c: string) => this.d("│ ") + c + " ".repeat(Math.max(0, iw - c.replace(/\x1b\[[0-9;]*m/g, "").length)) + this.d(" │");
-		const l: string[] = [];
+	render(width: number): string[] {
+		const t = this.theme;
+		const innerWidth = width - 4;
+		const horizontal = "─".repeat(width - 2);
+		const boxLine = (content: string) =>
+			this.dim("│ ") + content + " ".repeat(Math.max(0, innerWidth - content.replace(/\x1b\[[0-9;]*m/g, "").length)) + this.dim(" │");
+		const lines: string[] = [];
 
 		if (this.busy) {
-			l.push(this.d(`╭${hl}╮`), bx(this.b(this.a("multi-codex"))), this.d(`├${hl}┤`));
-			l.push(bx(`${this.busy}...`));
-			l.push(this.d(`╰${hl}╯`)); return l;
+			lines.push(this.dim(`╭${horizontal}╮`), boxLine(this.bold(this.accent("multi-codex"))), this.dim(`├${horizontal}┤`));
+			lines.push(boxLine(`${this.busy}...`));
+			lines.push(this.dim(`╰${horizontal}╯`));
+			return lines;
 		}
 
-		l.push(this.d(`╭${hl}╮`), bx(this.b(this.a("multi-codex"))), this.d(`├${hl}┤`));
+		lines.push(this.dim(`╭${horizontal}╮`), boxLine(this.bold(this.accent("multi-codex"))), this.dim(`├${horizontal}┤`));
 
-		if (this.loading) l.push(bx("loading..."));
-		else if (!this.rs.length) { l.push(bx("no accounts"), bx(""), bx(this.d("a  add account"))); }
-		else for (let i = 0; i < this.rs.length; i++) {
-			const r = this.rs[i];
-			const planLabel = r.plan ? t.fg("accent", ` ${r.plan}`) : "";
-			l.push(bx(`${i === this.sel ? t.fg("accent", "▸ ") : "  "}${this.b(`[${r.i}]`)} ${r.email}${planLabel}${r.active ? t.fg("success", " ●") : ""}`));
-			if (r.err) { l.push(bx(this.d(`   ${r.err}`))); continue; }
-			for (const w of r.win) {
-				const f = Math.min(10, Math.round(w.pct / 10)), e = 10 - f;
-				const bar = t.fg(w.clr, "█".repeat(f)) + this.d("░".repeat(e));
-				const rs = w.reset ? this.d(` ${fmt(new Date(w.reset))}`) : "";
-				l.push(bx(`   ${w.n.padEnd(8)} ${bar} ${w.pct.toFixed(0).padStart(3)}%${rs}`));
+		if (this.loading) {
+			lines.push(boxLine("loading..."));
+		} else if (!this.rows.length) {
+			lines.push(boxLine("no accounts"), boxLine(""), boxLine(this.dim("a  add account")));
+		} else {
+			for (let i = 0; i < this.rows.length; i++) {
+				const row = this.rows[i];
+				const planLabel = row.plan ? t.fg("accent", ` ${row.plan}`) : "";
+				lines.push(
+					boxLine(
+						`${i === this.selected ? t.fg("accent", "▸ ") : "  "}${this.bold(`[${row.index}]`)} ${row.email}${planLabel}${row.active ? t.fg("success", " ●") : ""}`,
+					),
+				);
+				if (row.error) {
+					lines.push(boxLine(this.dim(`   ${row.error}`)));
+					continue;
+				}
+				for (const win of row.windows) {
+					const filled = Math.min(10, Math.round(win.pct / 10));
+					const empty = 10 - filled;
+					const bar = t.fg(win.color, "█".repeat(filled)) + this.dim("░".repeat(empty));
+					const resetLabel = win.reset ? this.dim(` ${formatReset(new Date(win.reset))}`) : "";
+					lines.push(boxLine(`   ${win.name.padEnd(8)} ${bar} ${win.pct.toFixed(0).padStart(3)}%${resetLabel}`));
+				}
 			}
 		}
 
-		l.push(this.d(`├${hl}┤`), bx(this.d("↑↓ select  a add  ↵ switch  ⌫ remove  esc close")), this.d(`╰${hl}╯`));
-		return l;
+		lines.push(
+			this.dim(`├${horizontal}┤`),
+			boxLine(this.dim("↑↓ select  a add  ↵ switch  ⌫ remove  esc close")),
+			this.dim(`╰${horizontal}╯`),
+		);
+		return lines;
 	}
 }
 
-function fmt(d: Date): string {
-	const df = d.getTime() - Date.now(); if (df < 0) return "now";
-	const m = Math.floor(df / 60000); if (m < 60) return `in ${m}m`;
-	const h = Math.floor(m / 60); if (h < 24) return `in ${h}h${m % 60 ? ` ${m % 60}m` : ""}`;
-	return `in ${Math.floor(h / 24)}d`;
+function formatReset(date: Date): string {
+	const diff = date.getTime() - Date.now();
+	if (diff < 0) return "now";
+	const minutes = Math.floor(diff / 60000);
+	if (minutes < 60) return `in ${minutes}m`;
+	const hours = Math.floor(minutes / 60);
+	if (hours < 24) return `in ${hours}h${minutes % 60 ? ` ${minutes % 60}m` : ""}`;
+	return `in ${Math.floor(hours / 24)}d`;
 }
 
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
-		const as = ctx.modelRegistry.authStorage;
-		for (const k of as.list?.() ?? []) {
-			if (k.startsWith(PF) || k === ACT) {
-				try { await as.getApiKey(k); } catch {}
+		const authStorage = ctx.modelRegistry.authStorage;
+		for (const key of authStorage.list?.() ?? []) {
+			if (key === ACTIVE_POINTER_KEY) continue;
+			if (key.startsWith(ACCOUNT_PREFIX) || key === ACTIVE_KEY) {
+				try {
+					await authStorage.getApiKey(key);
+				} catch (err) {
+					debug("session_start refresh failed", key, err);
+				}
 			}
 		}
 	});
@@ -233,60 +402,66 @@ export default function (pi: ExtensionAPI) {
 		if (event.message.role !== "assistant") return;
 		const msg = event.message as any;
 		if (msg.stopReason !== "error") return;
-		const em = msg.errorMessage ?? "";
-		if (!/usage.limit/i.test(em)) return;
+		const errorMessage = msg.errorMessage ?? "";
+		if (!/usage.limit/i.test(errorMessage)) return;
 
-		const as = ctx.modelRegistry.authStorage;
-		const accounts = getAccounts(as);
+		const authStorage = ctx.modelRegistry.authStorage;
+		const accounts = getAccounts(authStorage);
 		if (accounts.length <= 1) return;
 
-		const activeKey = getActive(as);
-		// Score accounts: prefer capacity-first, then soonest reset as tiebreaker
-		const scored: Array<{ key: string; pct: number; reset: number; cred: any }> = [];
-		for (const k of accounts) {
-			const v = as.get(k);
-			if (!v) continue;
-			const ak = (Date.now() >= (v as any).expires) ? await as.getApiKey(k).catch(() => undefined) : (v as any).access;
-			if (!ak) continue;
-			const u = await fetchUsage(ak);
-			if (!u?.w) continue;
-			// Use the most-limiting window's percentage
-			const now = Date.now();
-			const pp = (u.w["primary"]?.reset && u.w["primary"].reset! <= now) ? 0 : (u.w["primary"]?.pct ?? 0);
-			const wp = (u.w["week"]?.reset && u.w["week"].reset! <= now) ? 0 : (u.w["week"]?.pct ?? 0);
-			const pct = Math.max(pp, wp);
-			const rp = u.w["primary"]?.reset ?? Infinity;
-			const rw = u.w["week"]?.reset ?? Infinity;
-			const reset = Math.min(rp, rw);
-			scored.push({ key: k, pct, reset, cred: v });
-		}
+		const activeKey = getActive(authStorage);
+
+		// Score accounts in parallel: prefer capacity first, then soonest reset.
+		const scored = (
+			await Promise.all(
+				accounts.map(async (key) => {
+					const cred = authStorage.get(key);
+					if (!cred) return null;
+					const apiKey = await resolveApiKey(authStorage, key, cred);
+					if (!apiKey) return null;
+					const usage = await fetchUsage(apiKey);
+					if (!usage?.windows) return null;
+
+					const now = Date.now();
+					const primary = usage.windows["primary"];
+					const week = usage.windows["week"];
+					const primaryPct = primary?.reset && primary.reset <= now ? 0 : (primary?.pct ?? 0);
+					const weekPct = week?.reset && week.reset <= now ? 0 : (week?.pct ?? 0);
+					const pct = Math.max(primaryPct, weekPct);
+					const reset = Math.min(primary?.reset ?? Infinity, week?.reset ?? Infinity);
+					return { key, pct, reset, cred: authStorage.get(key) ?? cred };
+				}),
+			)
+		).filter((s): s is { key: string; pct: number; reset: number; cred: any } => s !== null);
+
 		if (scored.length === 0) return;
 
-		// Sort: accounts with capacity first (pct < 100), then by soonest reset
 		scored.sort((a, b) => {
-			const aHas = a.pct < 100 ? 0 : 1;
-			const bHas = b.pct < 100 ? 0 : 1;
-			if (aHas !== bHas) return aHas - bHas;
+			const aHasCapacity = a.pct < 100 ? 0 : 1;
+			const bHasCapacity = b.pct < 100 ? 0 : 1;
+			if (aHasCapacity !== bHasCapacity) return aHasCapacity - bHasCapacity;
 			return a.reset - b.reset;
 		});
 
-		const best = scored.find(s => s.key !== activeKey) ?? scored[0];
+		const best = scored.find((s) => s.key !== activeKey) ?? scored[0];
 
-		// Don't switch to an account that's also fully rate-limited
 		if (best.pct >= 100) {
 			ctx.ui.notify("All accounts rate-limited — wait for reset", "error");
 			return;
 		}
 
-		as.set(ACT, best.cred);
-		const r = new Date(best.reset);
-		ctx.ui.notify(`Switched to [${best.key.slice(PF.length)}] (resets ${r.getHours()}:${String(r.getMinutes()).padStart(2, "0")})`, "warning");
+		setActive(authStorage, best.key, best.cred);
+		const resetDate = new Date(best.reset);
+		ctx.ui.notify(
+			`Switched to [${best.key.slice(ACCOUNT_PREFIX.length)}] (resets ${resetDate.getHours()}:${String(resetDate.getMinutes()).padStart(2, "0")})`,
+			"warning",
+		);
 
 		const entries = ctx.sessionManager.getEntries();
 		for (let i = entries.length - 1; i >= 0; i--) {
-			const e = entries[i];
-			if (e.type === "message" && e.role === "user") {
-				pi.sendUserMessage(e.content, { deliverAs: "followUp" });
+			const entry = entries[i];
+			if (entry.type === "message" && entry.message.role === "user") {
+				pi.sendUserMessage(entry.message.content, { deliverAs: "followUp" });
 				break;
 			}
 		}
@@ -295,7 +470,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("multi-codex", {
 		description: "Manage multiple OpenAI Codex accounts",
 		handler: async (_args, ctx) => {
-			await ctx.ui.custom((tu: any, th: any, _kb: any, done: () => void) => new List(tu, th, done, ctx));
+			await ctx.ui.custom((tu: any, th: any, _kb: any, done: (result?: unknown) => void) => new List(tu, th, done, ctx));
 		},
 	});
 }
