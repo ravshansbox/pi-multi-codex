@@ -12,11 +12,6 @@ function debug(...args: unknown[]): void {
 	if (DEBUG) console.error("[multi-codex]", ...args);
 }
 
-interface CodexUsageWindow {
-	pct: number;
-	reset?: number;
-}
-
 interface CodexUsageResponse {
 	rate_limit?: {
 		primary_window?: {
@@ -36,7 +31,7 @@ interface CodexUsageResponse {
 
 async function fetchUsage(apiKey: string) {
 	try {
-		const res = await fetch("https://chatgpt.com/backend-api/wham/usage", {
+		const response = await fetch("https://chatgpt.com/backend-api/wham/usage", {
 			headers: {
 				Authorization: `Bearer ${apiKey}`,
 				"User-Agent": "pi-agent",
@@ -45,27 +40,27 @@ async function fetchUsage(apiKey: string) {
 			signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
 		});
 
-		if (!res.ok) {
-			debug("fetchUsage non-ok", res.status);
+		if (!response.ok) {
+			debug("fetchUsage non-ok", response.status);
 			return null;
 		}
 
-		const data = (await res.json()) as CodexUsageResponse;
+		const data = (await response.json()) as CodexUsageResponse;
 		const windows: Record<string, { percent: number; reset?: number }> = {};
 		const ONE_DAY_SECONDS = 86_400;
 
-		for (const raw of [data.rate_limit?.primary_window, data.rate_limit?.secondary_window]) {
-			if (!raw) continue;
+		for (const rawWindow of [data.rate_limit?.primary_window, data.rate_limit?.secondary_window]) {
+			if (!rawWindow) continue;
 
-			const durationSeconds: number = raw.limit_window_seconds ?? 0;
+			const durationSeconds: number = rawWindow.limit_window_seconds ?? 0;
 			const label =
 				durationSeconds > 0 && durationSeconds < ONE_DAY_SECONDS
 					? "primary"
 					: "week";
 
 			windows[label] = {
-				percent: raw.used_percent || 0,
-				reset: raw.reset_at ? raw.reset_at * 1000 : undefined,
+				percent: rawWindow.used_percent || 0,
+				reset: rawWindow.reset_at ? rawWindow.reset_at * 1000 : undefined,
 			};
 		}
 
@@ -75,8 +70,8 @@ async function fetchUsage(apiKey: string) {
 		const email = typeof data.email === "string" ? data.email : undefined;
 
 		return { windows, plan, email };
-	} catch (err) {
-		debug("fetchUsage error", err);
+	} catch (error) {
+		debug("fetchUsage error", error);
 		return null;
 	}
 }
@@ -91,8 +86,8 @@ function parseEmailFromJwt(apiKey: string): string | undefined {
 		);
 
 		return decoded?.["https://api.openai.com/profile"]?.email as string | undefined;
-	} catch (err) {
-		debug("parseEmailFromJwt error", err);
+	} catch (error) {
+		debug("parseEmailFromJwt error", error);
 		return undefined;
 	}
 }
@@ -127,22 +122,11 @@ function getActiveAccountKey(authStorage: AuthStorage): string | undefined {
 	return undefined;
 }
 
-function isCredentialExpired(credential: any): boolean {
-	const expires: unknown = credential?.expires;
-	if (typeof expires !== "number") return true;
-	return Date.now() >= expires;
-}
-
 async function getAccessToken(authStorage: AuthStorage, key: string): Promise<string | undefined> {
-	const credential = authStorage.get(key);
-	if (!credential) return undefined;
-
-	if (credential.type === "api_key" && !isCredentialExpired(credential)) {
-		return (credential as ApiKeyCredential).key;
-	}
-
-	return authStorage.getApiKey(key).catch((err: unknown) => {
-		debug("getApiKey error", key, err);
+	// getApiKey resolves the stored credential and auto-refreshes OAuth tokens
+	// (with cross-process file locking) before returning the bearer token.
+	return authStorage.getApiKey(key).catch((error: unknown) => {
+		debug("getApiKey error", key, error);
 		return undefined;
 	});
 }
@@ -328,6 +312,9 @@ class AccountList implements Component {
 		if (!row || row.active) return;
 
 		const authStorage = this.context.modelRegistry.authStorage;
+		// Refresh the token (if expired) before activating, so we never copy a
+		// stale credential into ACTIVE_KEY.
+		await getAccessToken(authStorage, row.key);
 		const credential = authStorage.get(row.key);
 		if (credential) {
 			authStorage.set(ACTIVE_KEY, credential);
@@ -364,7 +351,7 @@ class AccountList implements Component {
 						exec(openCmd);
 					});
 				},
-				onProgress: (msg: string) => this.context.ui.notify(msg, "info"),
+				onProgress: (message: string) => this.context.ui.notify(message, "info"),
 				onPrompt: async ({ message }: { message: string }) => {
 					const value = await this.context.ui.input(message);
 					if (!value?.trim()) throw new Error("Cancelled");
@@ -476,17 +463,17 @@ class AccountList implements Component {
 					continue;
 				}
 
-				for (const window of row.usageWindows) {
-					const filled = Math.min(10, Math.round(window.percent / 10));
+				for (const usageWindow of row.usageWindows) {
+					const filled = Math.min(10, Math.round(usageWindow.percent / 10));
 					const empty = 10 - filled;
-					const bar = theme.fg(window.color, "█".repeat(filled)) + this.dim("░".repeat(empty));
-					const resetLabel = window.reset
-						? this.dim(` ${formatCountdown(new Date(window.reset))}`)
+					const bar = theme.fg(usageWindow.color, "█".repeat(filled)) + this.dim("░".repeat(empty));
+					const resetLabel = usageWindow.reset
+						? this.dim(` ${formatCountdown(new Date(usageWindow.reset))}`)
 						: "";
 
 					lines.push(
 						boxLine(
-							`   ${window.name.padEnd(7)} ${bar} ${window.percent.toFixed(0).padStart(3)}%${resetLabel}`,
+							`   ${usageWindow.name.padEnd(7)} ${bar} ${usageWindow.percent.toFixed(0).padStart(3)}%${resetLabel}`,
 						),
 					);
 				}
@@ -526,20 +513,19 @@ export default function (pi: ExtensionAPI) {
 			if (key.startsWith(ACCOUNT_PREFIX) || key === ACTIVE_KEY) {
 				try {
 					await getAccessToken(authStorage, key);
-				} catch (err) {
-					debug("session_start refresh failed", key, err);
+				} catch (error) {
+					debug("session_start refresh failed", key, error);
 				}
 			}
 		}
 	});
 
 	pi.on("message_end", async (event, context) => {
-		if (event.message.role !== "assistant") return;
+		const message = event.message;
+		if (message.role !== "assistant") return;
+		if (message.stopReason !== "error") return;
 
-		const msg = event.message as any;
-		if (msg.stopReason !== "error") return;
-
-		const errorMessage: string = msg.errorMessage ?? "";
+		const errorMessage: string = message.errorMessage ?? "";
 		if (!/usage.limit/i.test(errorMessage)) return;
 
 		const authStorage = context.modelRegistry.authStorage;
@@ -561,12 +547,12 @@ export default function (pi: ExtensionAPI) {
 					const primary = usage.windows["primary"];
 					const week = usage.windows["week"];
 
-					const primaryPct =
+					const primaryPercent =
 						primary?.reset && primary.reset <= now ? 0 : (primary?.percent ?? 0);
-					const weekPct =
+					const weekPercent =
 						week?.reset && week.reset <= now ? 0 : (week?.percent ?? 0);
 
-					const usagePct = Math.max(primaryPct, weekPct);
+					const usagePercent = Math.max(primaryPercent, weekPercent);
 					const resetAt = Math.min(
 						primary?.reset ?? Infinity,
 						week?.reset ?? Infinity,
@@ -574,32 +560,32 @@ export default function (pi: ExtensionAPI) {
 
 					const credential = authStorage.get(key);
 					if (!credential) return null;
-					return { key, pct: usagePct, reset: resetAt, credential };
+					return { key, percent: usagePercent, reset: resetAt, credential };
 				}),
 			)
 		).filter(
 			(
-				s,
-			): s is {
+				entry,
+			): entry is {
 				key: string;
-				pct: number;
+				percent: number;
 				reset: number;
 				credential: AuthCredential;
-			} => s !== null,
+			} => entry !== null,
 		);
 
 		if (scored.length === 0) return;
 
-		scored.sort((a, b) => {
-			const aExhausted = a.pct >= 100 ? 1 : 0;
-			const bExhausted = b.pct >= 100 ? 1 : 0;
-			if (aExhausted !== bExhausted) return aExhausted - bExhausted;
-			return a.reset - b.reset;
+		scored.sort((first, second) => {
+			const firstExhausted = first.percent >= 100 ? 1 : 0;
+			const secondExhausted = second.percent >= 100 ? 1 : 0;
+			if (firstExhausted !== secondExhausted) return firstExhausted - secondExhausted;
+			return first.reset - second.reset;
 		});
 
-		const best = scored.find((s) => s.key !== activeKey) ?? scored[0];
+		const best = scored.find((entry) => entry.key !== activeKey) ?? scored[0];
 
-		if (best.pct >= 100) {
+		if (best.percent >= 100) {
 			context.ui.notify("All accounts rate-limited — wait for reset", "error");
 			return;
 		}
