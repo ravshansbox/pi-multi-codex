@@ -29,7 +29,13 @@ interface CodexUsageResponse {
 	email?: string;
 }
 
-async function fetchUsage(apiKey: string) {
+interface UsageResult {
+	windows: Record<string, { percent: number; reset?: number }>;
+	plan?: string;
+	email?: string;
+}
+
+async function fetchUsage(apiKey: string): Promise<UsageResult | "unauthorized" | null> {
 	try {
 		const response = await fetch("https://chatgpt.com/backend-api/wham/usage", {
 			headers: {
@@ -42,6 +48,8 @@ async function fetchUsage(apiKey: string) {
 
 		if (!response.ok) {
 			debug("fetchUsage non-ok", response.status);
+			// Signal auth failures distinctly so the caller can try a refresh.
+			if (response.status === 401 || response.status === 403) return "unauthorized";
 			return null;
 		}
 
@@ -122,13 +130,56 @@ function getActiveAccountKey(authStorage: AuthStorage): string | undefined {
 	return undefined;
 }
 
-async function getAccessToken(authStorage: AuthStorage, key: string): Promise<string | undefined> {
-	// getApiKey resolves the stored credential and auto-refreshes OAuth tokens
-	// (with cross-process file locking) before returning the bearer token.
-	return authStorage.getApiKey(key).catch((error: unknown) => {
-		debug("getApiKey error", key, error);
-		return undefined;
-	});
+/**
+ * Resolve a usable bearer token for an account.
+ *
+ * The stored credential already contains a token — use it directly. Do NOT call
+ * authStorage.getApiKey(key) for numbered account keys: it looks up an OAuth
+ * provider by the exact key string, but providers are only registered under
+ * ACTIVE_KEY ("openai-codex"). Passing "openai-codex-0" hits
+ * `getOAuthProvider(id) === undefined` and returns undefined, which this
+ * extension renders as "auth expired" for EVERY account regardless of how
+ * recently you logged in. That was the bug.
+ *
+ * We hand the raw token to the caller and let the actual usage request be the
+ * source of truth — try the token first, refresh only if it genuinely fails.
+ */
+function getStoredToken(authStorage: AuthStorage, key: string): string | undefined {
+	const credential = authStorage.get(key);
+	if (!credential) return undefined;
+	if (credential.type === "api_key") return credential.key;
+	if (credential.type === "oauth") return (credential as OAuthCredential).access;
+	return undefined;
+}
+
+/**
+ * Refresh an expired account via the registered provider id, persisting the
+ * refreshed credential back to the account's own storage key. Only used as a
+ * fallback when the stored token is actually rejected by the API.
+ */
+async function refreshAccount(authStorage: AuthStorage, key: string): Promise<string | undefined> {
+	const original = authStorage.get(key);
+	if (!original || original.type !== "oauth") return undefined;
+
+	const previousActive = authStorage.get(ACTIVE_KEY);
+	const wasActive = getActiveAccountKey(authStorage) === key;
+
+	try {
+		// getApiKey only knows the provider registered under ACTIVE_KEY, so route
+		// the refresh through it, then copy the refreshed credential back.
+		authStorage.set(ACTIVE_KEY, original);
+		const token = await authStorage.getApiKey(ACTIVE_KEY).catch((error: unknown) => {
+			debug("refresh error", key, error);
+			return undefined;
+		});
+		const refreshed = authStorage.get(ACTIVE_KEY);
+		if (refreshed) authStorage.set(key, refreshed);
+		return token ?? undefined;
+	} finally {
+		if (previousActive && !wasActive) {
+			authStorage.set(ACTIVE_KEY, previousActive);
+		}
+	}
 }
 
 type UsageColor = "error" | "warning" | "success";
@@ -209,8 +260,20 @@ class AccountList implements Component {
 				continue;
 			}
 
-			const apiKey = await getAccessToken(authStorage, accountKey);
-			if (!apiKey) {
+			// Try the stored token first — it's almost always valid right after
+			// login. Only fall back to a refresh if the API actually rejects it.
+			let apiKey = getStoredToken(authStorage, accountKey);
+			let usage = apiKey ? await fetchUsage(apiKey) : "unauthorized";
+
+			if (usage === "unauthorized") {
+				const refreshed = await refreshAccount(authStorage, accountKey);
+				if (refreshed) {
+					apiKey = refreshed;
+					usage = await fetchUsage(refreshed);
+				}
+			}
+
+			if (!apiKey || usage === "unauthorized") {
 				rows.push({
 					key: accountKey,
 					index: accountIndex,
@@ -222,12 +285,12 @@ class AccountList implements Component {
 				continue;
 			}
 
-			const usage = await fetchUsage(apiKey);
-			const email = parseEmailFromJwt(apiKey) ?? usage?.email;
+			const usageData = usage; // null = fetch failed, UsageResult = ok
+			const email = parseEmailFromJwt(apiKey) ?? usageData?.email;
 			const usageWindows: UsageWindowRow[] = [];
 
-			if (usage?.windows) {
-				const entries = Object.entries(usage.windows).sort(
+			if (usageData?.windows) {
+				const entries = Object.entries(usageData.windows).sort(
 					(a, b) => (USAGE_SORT_ORDER[a[0]] ?? 99) - (USAGE_SORT_ORDER[b[0]] ?? 99),
 				);
 				for (const [windowName, windowData] of entries) {
@@ -245,9 +308,9 @@ class AccountList implements Component {
 				key: accountKey,
 				index: accountIndex,
 				email: email ?? "unknown",
-				plan: usage?.plan,
+				plan: usageData?.plan,
 				usageWindows,
-				error: usage ? undefined : "fetch failed",
+				error: usageData ? undefined : "fetch failed",
 				active: accountKey === activeKey,
 			});
 		}
@@ -312,9 +375,9 @@ class AccountList implements Component {
 		if (!row || row.active) return;
 
 		const authStorage = this.context.modelRegistry.authStorage;
-		// Refresh the token (if expired) before activating, so we never copy a
-		// stale credential into ACTIVE_KEY.
-		await getAccessToken(authStorage, row.key);
+		// Copy this account's stored credential into the active provider key.
+		// The token is valid as-is; if it ever needs refreshing, the registered
+		// provider (ACTIVE_KEY) will handle that on the next request.
 		const credential = authStorage.get(row.key);
 		if (credential) {
 			authStorage.set(ACTIVE_KEY, credential);
@@ -508,15 +571,14 @@ function formatCountdown(date: Date): string {
 
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, context) => {
+		// Only the active provider key ("openai-codex") is a registered OAuth
+		// provider, so it's the only one getApiKey can refresh. Numbered account
+		// keys keep their stored tokens and are refreshed lazily on demand.
 		const authStorage = context.modelRegistry.authStorage;
-		for (const key of authStorage.list()) {
-			if (key.startsWith(ACCOUNT_PREFIX) || key === ACTIVE_KEY) {
-				try {
-					await getAccessToken(authStorage, key);
-				} catch (error) {
-					debug("session_start refresh failed", key, error);
-				}
-			}
+		try {
+			await authStorage.getApiKey(ACTIVE_KEY);
+		} catch (error) {
+			debug("session_start refresh failed", error);
 		}
 	});
 
@@ -537,15 +599,21 @@ export default function (pi: ExtensionAPI) {
 		const scored = (
 			await Promise.all(
 				accountKeys.map(async (key) => {
-					const accessToken = await getAccessToken(authStorage, key);
-					if (!accessToken) return null;
-
-					const usage = await fetchUsage(accessToken);
-					if (!usage?.windows) return null;
+					let accessToken = getStoredToken(authStorage, key);
+					let usage = accessToken ? await fetchUsage(accessToken) : "unauthorized";
+					if (usage === "unauthorized") {
+						const refreshed = await refreshAccount(authStorage, key);
+						if (refreshed) {
+							accessToken = refreshed;
+							usage = await fetchUsage(refreshed);
+						}
+					}
+					if (!accessToken || usage === "unauthorized" || !usage || !usage.windows) return null;
+					const usageData = usage;
 
 					const now = Date.now();
-					const primary = usage.windows["primary"];
-					const week = usage.windows["week"];
+					const primary = usageData.windows["primary"];
+					const week = usageData.windows["week"];
 
 					const primaryPercent =
 						primary?.reset && primary.reset <= now ? 0 : (primary?.percent ?? 0);
