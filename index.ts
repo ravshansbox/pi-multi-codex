@@ -671,11 +671,8 @@ export default function (pi: ExtensionAPI) {
 
 		authStorage.set(ACTIVE_KEY, best.credential);
 
-		const resetDate = new Date(best.reset);
 		context.ui.notify(
-			`Switched account ` +
-				`(resets ${resetDate.getHours()}:` +
-				`${String(resetDate.getMinutes()).padStart(2, "0")})`,
+			`Switched account (resets ${formatCountdown(new Date(best.reset))})`,
 			"warning",
 		);
 
