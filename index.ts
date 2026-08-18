@@ -1,13 +1,17 @@
-import { loginOpenAICodex } from '@earendil-works/pi-ai/oauth';
+import type {
+  ApiKeyCredential,
+  Credential,
+  OAuthAuth,
+  OAuthCredential,
+} from '@earendil-works/pi-ai';
+import { openaiCodexProvider } from '@earendil-works/pi-ai/providers/openai-codex';
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
-  AuthStorage,
   Theme,
-  OAuthCredential,
-  ApiKeyCredential,
-  AuthCredential,
 } from '@earendil-works/pi-coding-agent';
+import { AccountStore } from './auth-store.ts';
+import { createInteraction } from './oauth-interaction.ts';
 import {
   matchesKey,
   type TUI,
@@ -133,14 +137,20 @@ function makeAccountKey(index: number): string {
   return `${ACCOUNT_PREFIX}${index}`;
 }
 
-function getAccountKeys(authStorage: AuthStorage): string[] {
+function codexOAuth(): OAuthAuth {
+  const oauth = openaiCodexProvider().auth.oauth;
+  if (!oauth) throw new Error('OpenAI Codex provider exposes no OAuth flow');
+  return oauth;
+}
+
+function getAccountKeys(authStorage: AccountStore): string[] {
   return authStorage
     .list()
-    .filter((key) => key.startsWith(ACCOUNT_PREFIX))
+    .filter((key: string) => key.startsWith(ACCOUNT_PREFIX))
     .sort();
 }
 
-function getActiveAccountKey(authStorage: AuthStorage): string | undefined {
+function getActiveAccountKey(authStorage: AccountStore): string | undefined {
   const activeCredential = authStorage.get(ACTIVE_KEY);
   if (!activeCredential) return undefined;
 
@@ -176,7 +186,7 @@ function getActiveAccountKey(authStorage: AuthStorage): string | undefined {
  * source of truth — try the token first, refresh only if it genuinely fails.
  */
 function getStoredToken(
-  authStorage: AuthStorage,
+  authStorage: AccountStore,
   key: string,
 ): string | undefined {
   const credential = authStorage.get(key);
@@ -188,47 +198,32 @@ function getStoredToken(
 }
 
 /**
- * Refresh an expired numbered account via the registered provider id, persisting
- * the refreshed credential back to the account's own storage key.
+ * Refresh an expired numbered account directly through the provider OAuth flow,
+ * persisting the refreshed credential back to the account's own storage key.
  *
- * Do not refresh ACTIVE_KEY as a separate account. ACTIVE_KEY is only used as the
- * provider refresh channel because pi registers the OAuth provider under that id.
- * If the refreshed numbered account is the active one, copy the refreshed
- * credential to ACTIVE_KEY exactly once.
+ * The flow refreshes a credential we pass in, so numbered accounts no longer
+ * need routing through ACTIVE_KEY. ACTIVE_KEY only tracks the selected account.
  */
 async function refreshAccount(
-  authStorage: AuthStorage,
+  authStorage: AccountStore,
   key: string,
 ): Promise<string | undefined> {
   const original = authStorage.get(key);
   if (!original || original.type !== 'oauth') return undefined;
 
-  const previousActive = authStorage.get(ACTIVE_KEY);
   const wasActive = getActiveAccountKey(authStorage) === key;
 
-  try {
-    // getApiKey only knows the provider registered under ACTIVE_KEY, so route
-    // numbered-account refreshes through it, then persist the refreshed value.
-    authStorage.set(ACTIVE_KEY, original);
-    const token = await authStorage
-      .getApiKey(ACTIVE_KEY)
-      .catch((error: unknown) => {
-        debug('refresh error', key, error);
-        return undefined;
-      });
-    const refreshed = authStorage.get(ACTIVE_KEY);
-    if (refreshed) authStorage.set(key, refreshed);
-    return token ?? undefined;
-  } finally {
-    const refreshed = authStorage.get(key);
-    if (wasActive && refreshed) {
-      authStorage.set(ACTIVE_KEY, refreshed);
-    } else if (previousActive) {
-      authStorage.set(ACTIVE_KEY, previousActive);
-    } else {
-      authStorage.remove(ACTIVE_KEY);
-    }
-  }
+  const refreshed = await codexOAuth()
+    .refresh(original, AbortSignal.timeout(FETCH_TIMEOUT_MS))
+    .catch((error: unknown) => {
+      debug('refresh error', key, error);
+      return undefined;
+    });
+  if (!refreshed) return undefined;
+
+  authStorage.set(key, refreshed);
+  if (wasActive) authStorage.set(ACTIVE_KEY, refreshed);
+  return refreshed.access;
 }
 
 type UsageColor = 'error' | 'warning' | 'success';
@@ -289,7 +284,7 @@ class AccountList implements Component {
   }
 
   private async init() {
-    const authStorage = this.context.modelRegistry.authStorage;
+    const authStorage = new AccountStore();
     const accountKeys = getAccountKeys(authStorage);
     const activeKey = getActiveAccountKey(authStorage);
     const rows: AccountRow[] = [];
@@ -436,7 +431,7 @@ class AccountList implements Component {
     const row = this.rows[this.selectedIndex];
     if (!row || row.active) return;
 
-    const authStorage = this.context.modelRegistry.authStorage;
+    const authStorage = new AccountStore();
     // Copy this account's stored credential into the active provider key without refreshing ACTIVE_KEY.
     const credential = authStorage.get(row.key);
     if (credential) {
@@ -457,34 +452,16 @@ class AccountList implements Component {
 
   private async addAccount() {
     try {
-      const credentials = await loginOpenAICodex({
-        onAuth: ({ url, instructions }) => {
-          this.context.ui.notify(`Open: ${url}`, 'info');
-          if (instructions) this.context.ui.notify(instructions, 'info');
-
-          void import('node:child_process').then(({ exec }) => {
-            let openCmd: string;
-            if (process.platform === 'darwin') {
-              openCmd = `open '${url}'`;
-            } else if (process.platform === 'win32') {
-              openCmd = `start "" "${url}"`;
-            } else {
-              openCmd = `xdg-open '${url}'`;
-            }
-            exec(openCmd);
-          });
+      const interaction = createInteraction(
+        {
+          notify: (message, level) => this.context.ui.notify(message, level),
+          input: (message) => this.context.ui.input(message),
         },
-        onProgress: (message: string) =>
-          this.context.ui.notify(message, 'info'),
-        onPrompt: async ({ message }: { message: string }) => {
-          const value = await this.context.ui.input(message);
-          if (!value?.trim()) throw new Error('Cancelled');
-          return value.trim();
-        },
-        originator: 'pi',
-      });
+        new AbortController().signal,
+      );
+      const credentials = await codexOAuth().login(interaction);
 
-      const authStorage = this.context.modelRegistry.authStorage;
+      const authStorage = new AccountStore();
 
       let nextIndex = 0;
       for (const key of authStorage.list()) {
@@ -496,7 +473,7 @@ class AccountList implements Component {
         }
       }
 
-      const credential: AuthCredential = { ...credentials, type: 'oauth' };
+      const credential: Credential = credentials;
       authStorage.set(makeAccountKey(nextIndex), credential);
       authStorage.set(ACTIVE_KEY, credential);
 
@@ -518,7 +495,7 @@ class AccountList implements Component {
     const row = this.rows[this.selectedIndex];
     if (!row) return;
 
-    const authStorage = this.context.modelRegistry.authStorage;
+    const authStorage = new AccountStore();
     if (row.active) {
       authStorage.remove(ACTIVE_KEY);
     }
@@ -661,7 +638,7 @@ export default function (pi: ExtensionAPI) {
     const errorMessage: string = message.errorMessage ?? '';
     if (!/usage.limit/i.test(errorMessage)) return;
 
-    const authStorage = context.modelRegistry.authStorage;
+    const authStorage = new AccountStore();
     const accountKeys = getAccountKeys(authStorage);
     if (accountKeys.length <= 1) return;
 
@@ -719,7 +696,7 @@ export default function (pi: ExtensionAPI) {
         key: string;
         percent: number;
         reset: number;
-        credential: AuthCredential;
+        credential: Credential;
       } => entry !== null,
     );
 
