@@ -1,6 +1,6 @@
 {
   "name": "@ravshansbox/pi-multi-codex",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Multi-account provider extension for pi with OpenAI Codex smart routing",
   "license": "MIT",
   "type": "module",
