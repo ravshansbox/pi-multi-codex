@@ -18,5 +18,5 @@ For example, if the active Codex account hits a usage limit during a session, th
 
 ```bash
 npm install
-npm run typecheck
+npm run check
 ```
