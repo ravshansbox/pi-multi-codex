@@ -6,8 +6,8 @@ import type {
 } from '@earendil-works/pi-ai';
 import { openaiCodexProvider } from '@earendil-works/pi-ai/providers/openai-codex';
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from '@earendil-works/pi-coding-agent';
-import { AccountStore } from './auth-store.ts';
-import { createInteraction } from './oauth-interaction.ts';
+import { AccountStore } from './src/auth-store.ts';
+import { createInteraction } from './src/oauth-interaction.ts';
 import {
   matchesKey,
   visibleWidth,
