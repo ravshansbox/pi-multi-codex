@@ -5,11 +5,7 @@ import type {
   OAuthCredential,
 } from '@earendil-works/pi-ai';
 import { openaiCodexProvider } from '@earendil-works/pi-ai/providers/openai-codex';
-import type {
-  ExtensionAPI,
-  ExtensionCommandContext,
-  Theme,
-} from '@earendil-works/pi-coding-agent';
+import type { ExtensionAPI, ExtensionCommandContext, Theme } from '@earendil-works/pi-coding-agent';
 import { AccountStore } from './auth-store.ts';
 import { createInteraction } from './oauth-interaction.ts';
 import {
@@ -52,9 +48,7 @@ interface UsageResult {
   email?: string | undefined;
 }
 
-async function fetchUsage(
-  apiKey: string,
-): Promise<UsageResult | 'unauthorized' | null> {
+async function fetchUsage(apiKey: string): Promise<UsageResult | 'unauthorized' | null> {
   try {
     const response = await fetch('https://chatgpt.com/backend-api/wham/usage', {
       headers: {
@@ -67,29 +61,19 @@ async function fetchUsage(
 
     if (!response.ok) {
       debug('fetchUsage non-ok', response.status);
-      if (response.status === 401 || response.status === 403)
-        return 'unauthorized';
+      if (response.status === 401 || response.status === 403) return 'unauthorized';
       return null;
     }
 
     const data = (await response.json()) as CodexUsageResponse;
-    const windows: Record<
-      string,
-      { percent: number; reset?: number | undefined }
-    > = {};
+    const windows: Record<string, { percent: number; reset?: number | undefined }> = {};
     const ONE_DAY_SECONDS = 86_400;
 
-    for (const rawWindow of [
-      data.rate_limit?.primary_window,
-      data.rate_limit?.secondary_window,
-    ]) {
+    for (const rawWindow of [data.rate_limit?.primary_window, data.rate_limit?.secondary_window]) {
       if (!rawWindow) continue;
 
       const durationSeconds: number = rawWindow.limit_window_seconds ?? 0;
-      const label =
-        durationSeconds > 0 && durationSeconds < ONE_DAY_SECONDS
-          ? 'primary'
-          : 'week';
+      const label = durationSeconds > 0 && durationSeconds < ONE_DAY_SECONDS ? 'primary' : 'week';
 
       windows[label] = {
         percent: rawWindow.used_percent || 0,
@@ -117,15 +101,11 @@ function parseProfileFromJwt(apiKey: string): {
     const [, payloadB64] = apiKey.split('.');
     if (!payloadB64) return {};
 
-    const decoded = JSON.parse(
-      Buffer.from(payloadB64, 'base64url').toString('utf8'),
-    );
+    const decoded = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
 
     return {
-      email: decoded?.['https://api.openai.com/profile']?.email as
-        string | undefined,
-      plan: decoded?.['https://api.openai.com/auth']?.chatgpt_plan_type as
-        string | undefined,
+      email: decoded?.['https://api.openai.com/profile']?.email as string | undefined,
+      plan: decoded?.['https://api.openai.com/auth']?.chatgpt_plan_type as string | undefined,
     };
   } catch (error) {
     debug('parseProfileFromJwt error', error);
@@ -160,10 +140,8 @@ function getActiveAccountKey(authStorage: AccountStore): string | undefined {
       credential &&
       credential.type === activeCredential.type &&
       (activeCredential.type === 'oauth'
-        ? (credential as OAuthCredential).access ===
-          (activeCredential as OAuthCredential).access
-        : (credential as ApiKeyCredential).key ===
-          (activeCredential as ApiKeyCredential).key)
+        ? (credential as OAuthCredential).access === (activeCredential as OAuthCredential).access
+        : (credential as ApiKeyCredential).key === (activeCredential as ApiKeyCredential).key)
     ) {
       return accountKey;
     }
@@ -185,15 +163,11 @@ function getActiveAccountKey(authStorage: AccountStore): string | undefined {
  * We hand the raw token to the caller and let the actual usage request be the
  * source of truth — try the token first, refresh only if it genuinely fails.
  */
-function getStoredToken(
-  authStorage: AccountStore,
-  key: string,
-): string | undefined {
+function getStoredToken(authStorage: AccountStore, key: string): string | undefined {
   const credential = authStorage.get(key);
   if (!credential) return undefined;
   if (credential.type === 'api_key') return credential.key;
-  if (credential.type === 'oauth')
-    return (credential as OAuthCredential).access;
+  if (credential.type === 'oauth') return (credential as OAuthCredential).access;
   return undefined;
 }
 
@@ -204,10 +178,7 @@ function getStoredToken(
  * The flow refreshes a credential we pass in, so numbered accounts no longer
  * need routing through ACTIVE_KEY. ACTIVE_KEY only tracks the selected account.
  */
-async function refreshAccount(
-  authStorage: AccountStore,
-  key: string,
-): Promise<string | undefined> {
+async function refreshAccount(authStorage: AccountStore, key: string): Promise<string | undefined> {
   const original = authStorage.get(key);
   if (!original || original.type !== 'oauth') return undefined;
 
@@ -290,10 +261,7 @@ class AccountList implements Component {
     const rows: AccountRow[] = [];
 
     for (const accountKey of accountKeys) {
-      const accountIndex = parseInt(
-        accountKey.slice(ACCOUNT_PREFIX.length),
-        10,
-      );
+      const accountIndex = parseInt(accountKey.slice(ACCOUNT_PREFIX.length), 10);
       const credential = authStorage.get(accountKey);
       if (!credential) {
         rows.push({
@@ -338,8 +306,7 @@ class AccountList implements Component {
 
       if (usageData?.windows) {
         const entries = Object.entries(usageData.windows).sort(
-          (a, b) =>
-            (USAGE_SORT_ORDER[a[0]] ?? 99) - (USAGE_SORT_ORDER[b[0]] ?? 99),
+          (a, b) => (USAGE_SORT_ORDER[a[0]] ?? 99) - (USAGE_SORT_ORDER[b[0]] ?? 99),
         );
         for (const [windowName, windowData] of entries) {
           const remaining = 100 - windowData.percent;
@@ -347,12 +314,7 @@ class AccountList implements Component {
             name: windowName,
             percent: windowData.percent,
             reset: windowData.reset,
-            color:
-              remaining <= 10
-                ? 'error'
-                : remaining <= 30
-                  ? 'warning'
-                  : 'success',
+            color: remaining <= 10 ? 'error' : remaining <= 30 ? 'warning' : 'success',
           });
         }
       }
@@ -393,10 +355,7 @@ class AccountList implements Component {
     }
 
     if (matchesKey(event, 'down') || event === 'j') {
-      this.selectedIndex = Math.min(
-        this.rows.length - 1,
-        this.selectedIndex + 1,
-      );
+      this.selectedIndex = Math.min(this.rows.length - 1, this.selectedIndex + 1);
       this.tui.requestRender();
       return;
     }
@@ -503,10 +462,7 @@ class AccountList implements Component {
 
     this.loading = true;
     void this.init().then(() => {
-      this.selectedIndex = Math.max(
-        0,
-        Math.min(this.selectedIndex, this.rows.length - 1),
-      );
+      this.selectedIndex = Math.max(0, Math.min(this.selectedIndex, this.rows.length - 1));
       this.tui.requestRender();
     });
   }
@@ -547,11 +503,7 @@ class AccountList implements Component {
     if (this.loading) {
       lines.push(boxLine('loading...'));
     } else if (!this.rows.length) {
-      lines.push(
-        boxLine('no accounts'),
-        boxLine(''),
-        boxLine(this.dim('a  add account')),
-      );
+      lines.push(boxLine('no accounts'), boxLine(''), boxLine(this.dim('a  add account')));
     } else {
       for (const [index, row] of this.rows.entries()) {
         const isSelected = index === this.selectedIndex;
@@ -559,9 +511,7 @@ class AccountList implements Component {
         const planLabel = row.plan ? theme.fg('accent', ` ${row.plan}`) : '';
         const cursor = isSelected ? theme.fg('accent', '▸ ') : '  ';
         const activeDot = row.active ? theme.fg('success', ' ●') : '';
-        lines.push(
-          boxLine(`${cursor}${this.bold(row.email)}${planLabel}${activeDot}`),
-        );
+        lines.push(boxLine(`${cursor}${this.bold(row.email)}${planLabel}${activeDot}`));
 
         if (row.error) {
           lines.push(boxLine(this.dim(`   ${row.error}`)));
@@ -571,9 +521,7 @@ class AccountList implements Component {
         for (const usageWindow of row.usageWindows) {
           const filled = Math.min(10, Math.round(usageWindow.percent / 10));
           const empty = 10 - filled;
-          const bar =
-            theme.fg(usageWindow.color, '█'.repeat(filled)) +
-            this.dim('░'.repeat(empty));
+          const bar = theme.fg(usageWindow.color, '█'.repeat(filled)) + this.dim('░'.repeat(empty));
           const resetLabel = usageWindow.reset
             ? this.dim(` ${formatCountdown(new Date(usageWindow.reset))}`)
             : '';
@@ -599,15 +547,11 @@ class AccountList implements Component {
 
 function getWeeklyReset(row: AccountRow): number {
   return (
-    row.usageWindows.find((window) => window.name === 'week')?.reset ??
-    Number.POSITIVE_INFINITY
+    row.usageWindows.find((window) => window.name === 'week')?.reset ?? Number.POSITIVE_INFINITY
   );
 }
 
-function compareRowsByWeeklyReset(
-  first: AccountRow,
-  second: AccountRow,
-): number {
+function compareRowsByWeeklyReset(first: AccountRow, second: AccountRow): number {
   const resetDiff = getWeeklyReset(first) - getWeeklyReset(second);
   if (resetDiff !== 0) return resetDiff;
   return first.email.localeCompare(second.email);
@@ -648,9 +592,7 @@ export default function (pi: ExtensionAPI) {
       await Promise.all(
         accountKeys.map(async (key) => {
           let accessToken = getStoredToken(authStorage, key);
-          let usage = accessToken
-            ? await fetchUsage(accessToken)
-            : 'unauthorized';
+          let usage = accessToken ? await fetchUsage(accessToken) : 'unauthorized';
           if (usage === 'unauthorized') {
             const refreshed = await refreshAccount(authStorage, key);
             if (refreshed) {
@@ -658,13 +600,7 @@ export default function (pi: ExtensionAPI) {
               usage = await fetchUsage(refreshed);
             }
           }
-          if (
-            !accessToken ||
-            usage === 'unauthorized' ||
-            !usage ||
-            !usage.windows
-          )
-            return null;
+          if (!accessToken || usage === 'unauthorized' || !usage || !usage.windows) return null;
           const usageData = usage;
 
           const now = Date.now();
@@ -672,17 +608,11 @@ export default function (pi: ExtensionAPI) {
           const week = usageData.windows['week'];
 
           const primaryPercent =
-            primary?.reset && primary.reset <= now
-              ? 0
-              : (primary?.percent ?? 0);
-          const weekPercent =
-            week?.reset && week.reset <= now ? 0 : (week?.percent ?? 0);
+            primary?.reset && primary.reset <= now ? 0 : (primary?.percent ?? 0);
+          const weekPercent = week?.reset && week.reset <= now ? 0 : (week?.percent ?? 0);
 
           const usagePercent = Math.max(primaryPercent, weekPercent);
-          const resetAt = Math.min(
-            primary?.reset ?? Infinity,
-            week?.reset ?? Infinity,
-          );
+          const resetAt = Math.min(primary?.reset ?? Infinity, week?.reset ?? Infinity);
 
           const credential = authStorage.get(key);
           if (!credential) return null;
@@ -705,8 +635,7 @@ export default function (pi: ExtensionAPI) {
     scored.sort((first, second) => {
       const firstExhausted = first.percent >= 100 ? 1 : 0;
       const secondExhausted = second.percent >= 100 ? 1 : 0;
-      if (firstExhausted !== secondExhausted)
-        return firstExhausted - secondExhausted;
+      if (firstExhausted !== secondExhausted) return firstExhausted - secondExhausted;
       return first.reset - second.reset;
     });
 
@@ -746,8 +675,7 @@ export default function (pi: ExtensionAPI) {
     description: 'Manage multiple OpenAI Codex accounts',
     handler: async (_args, context) => {
       await context.ui.custom(
-        (tui, theme, keybindings, done) =>
-          new AccountList(tui, theme, keybindings, done, context),
+        (tui, theme, keybindings, done) => new AccountList(tui, theme, keybindings, done, context),
       );
     },
   });
