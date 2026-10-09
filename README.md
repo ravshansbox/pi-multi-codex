@@ -5,7 +5,7 @@ Multi-account OpenAI Codex routing extension for pi.
 ## Install
 
 ```bash
-pi install git:github.com/ravshansbox/pi-multi-codex
+pi install npm:@ravshansbox/pi-multi-codex
 ```
 
 ## Usage
