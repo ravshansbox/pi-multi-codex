@@ -150,20 +150,6 @@ function getActiveAccountKey(authStorage: AccountStore): string | undefined {
   return undefined;
 }
 
-/**
- * Resolve a usable bearer token for an account.
- *
- * The stored credential already contains a token — use it directly. Do NOT call
- * authStorage.getApiKey(key) for numbered account keys: it looks up an OAuth
- * provider by the exact key string, but providers are only registered under
- * ACTIVE_KEY ("openai-codex"). Passing "openai-codex-0" hits
- * `getOAuthProvider(id) === undefined` and returns undefined, which this
- * extension renders as "auth expired" for EVERY account regardless of how
- * recently you logged in. That was the bug.
- *
- * We hand the raw token to the caller and let the actual usage request be the
- * source of truth — try the token first, refresh only if it genuinely fails.
- */
 function getStoredToken(authStorage: AccountStore, key: string): string | undefined {
   const credential = authStorage.get(key);
   if (!credential) return undefined;
@@ -172,13 +158,6 @@ function getStoredToken(authStorage: AccountStore, key: string): string | undefi
   return undefined;
 }
 
-/**
- * Refresh an expired numbered account directly through the provider OAuth flow,
- * persisting the refreshed credential back to the account's own storage key.
- *
- * The flow refreshes a credential we pass in, so numbered accounts no longer
- * need routing through ACTIVE_KEY. ACTIVE_KEY only tracks the selected account.
- */
 async function refreshAccount(authStorage: AccountStore, key: string): Promise<string | undefined> {
   const original = authStorage.get(key);
   if (!original || original.type !== 'oauth') return undefined;
@@ -299,7 +278,7 @@ class AccountList implements Component {
         continue;
       }
 
-      const usageData = usage; // null = fetch failed, UsageResult = ok
+      const usageData = usage;
       const jwtProfile = parseProfileFromJwt(apiKey);
       const email = jwtProfile.email ?? usageData?.email;
       const plan = usageData?.plan ?? jwtProfile.plan;
@@ -392,7 +371,6 @@ class AccountList implements Component {
     if (!row || row.active) return;
 
     const authStorage = new AccountStore();
-    // Copy this account's stored credential into the active provider key without refreshing ACTIVE_KEY.
     const credential = authStorage.get(row.key);
     if (credential) {
       authStorage.set(ACTIVE_KEY, credential);
