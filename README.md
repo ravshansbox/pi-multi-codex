@@ -8,6 +8,8 @@ Multi-account OpenAI Codex routing extension for pi.
 pi install npm:@ravshansbox/pi-multi-codex
 ```
 
+Add `-l` to install it in project settings.
+
 ## Usage
 
 Pi loads the extension from `./index.ts`. Run `/multi-codex` in the TUI to add Codex accounts, switch between them, or remove old ones.
