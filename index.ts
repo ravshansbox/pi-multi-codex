@@ -635,10 +635,10 @@ export default function (pi: ExtensionAPI) {
 
     authStorage.set(ACTIVE_KEY, best.credential);
 
-    context.ui.notify(
-      `Switched account (resets ${formatCountdown(new Date(best.reset))})`,
-      'warning',
-    );
+    const resetLabel = Number.isFinite(best.reset)
+      ? ` (resets ${formatCountdown(new Date(best.reset))})`
+      : '';
+    context.ui.notify(`Switched account${resetLabel}`, 'warning');
 
     const entries = context.sessionManager.getEntries();
 
