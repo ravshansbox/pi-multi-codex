@@ -531,8 +531,9 @@ function getWeeklyReset(row: AccountRow): number {
 }
 
 function compareRowsByWeeklyReset(first: AccountRow, second: AccountRow): number {
-  const resetDiff = getWeeklyReset(first) - getWeeklyReset(second);
-  if (resetDiff !== 0) return resetDiff;
+  const firstReset = getWeeklyReset(first);
+  const secondReset = getWeeklyReset(second);
+  if (firstReset !== secondReset) return firstReset < secondReset ? -1 : 1;
   return first.email.localeCompare(second.email);
 }
 
