@@ -28,6 +28,7 @@ async function openList(auth: Record<string, unknown>, emails: Record<string, st
   let component: Rendered | undefined;
   const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
   const context = {
+    mode: 'tui',
     ui: {
       custom: (factory: (...args: unknown[]) => Rendered) => {
         component = factory({ requestRender: () => {} }, theme, {}, () => {});
@@ -44,6 +45,30 @@ async function openList(auth: Record<string, unknown>, emails: Record<string, st
   }
   throw new Error('account list did not load');
 }
+
+test('asks for the TUI in RPC mode instead of opening the list', async () => {
+  let command: Command | undefined;
+  extension({
+    on: () => {},
+    registerCommand: (_name: string, options: Command) => {
+      command = options;
+    },
+  } as never);
+  const notifications: string[] = [];
+  let opened = false;
+  await command!.handler('', {
+    mode: 'rpc',
+    hasUI: true,
+    ui: {
+      custom: async () => {
+        opened = true;
+      },
+      notify: (message: string) => notifications.push(message),
+    },
+  });
+  assert.equal(opened, false);
+  assert.deepEqual(notifications, ['/multi-codex requires interactive mode']);
+});
 
 test('accounts without a weekly reset are listed by email', async () => {
   const lines = await openList(

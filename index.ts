@@ -654,6 +654,10 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand('multi-codex', {
     description: 'Manage multiple OpenAI Codex accounts',
     handler: async (_args, context) => {
+      if (context.mode !== 'tui') {
+        context.ui.notify('/multi-codex requires interactive mode', 'error');
+        return;
+      }
       await context.ui.custom(
         (tui, theme, keybindings, done) => new AccountList(tui, theme, keybindings, done, context),
       );
